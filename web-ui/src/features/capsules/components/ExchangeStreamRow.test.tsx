@@ -1,0 +1,1923 @@
+// component-level enforcement of v3 §2's
+// normative rules, on top of the pure-function tests in
+// `exchange-row-state.test.ts` / `exchange-stream.test.ts`.
+import { cleanup, render, screen, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import { ExchangeStreamRow } from '@/features/capsules/components/ExchangeStreamRow'
+import { settleRowAsk as settleRowAskWith, type AskOutcome, type RowAsk } from '@/features/capsules/lib/ask-for-record'
+import { exchangeRowDomId } from '@/features/capsules/lib/exchange-pages'
+import { peerName as peerNameWith } from '@/features/capsules/lib/peer-names'
+import { formatExchangeTimestamp } from '@/features/capsules/lib/local-time'
+import {
+  CONFIRMED_NOT_KEPT,
+  SAVED_BECAUSE_YOU_ASKED,
+  OWN_RECORD_FAILS_WARNING,
+  SEE_IN_LOGS_NOT_ON_THIS_PAGE,
+  SERVED_FOR_PAY_NO_PAYER_TOOLTIP
+} from '@/features/capsules/lib/tooltip-copy'
+import { buildExchangeLedgerRows, type ExchangeLedgerRow } from '@/features/capsules/lib/exchange-ledger'
+import type { RightCellStateKind } from '@/features/capsules/lib/exchange-row-state'
+import { durationText, formatModelIdentity, tokenFlowText } from '@/features/capsules/lib/serving-provenance'
+import type { RailSegment } from '@/features/capsules/lib/exchange-stream'
+import type { PaneCRow } from '@/features/capsules/api/sidecarTypes'
+import type { CapsuleRecord } from '@/features/capsules/api/types'
+import {
+  usePeerLedgerRecompute,
+  useRecomputedIdentity,
+  type PeerRecomputeState
+} from '@/features/capsules/lib/recompute-identity'
+import {
+  FIXTURE_PROVIDER_NODE,
+  fixtureHalfBody,
+  fixtureMineCell,
+  fixtureTheirsCell
+} from '@/features/capsules/lib/pushed-half-fixtures'
+
+const REQUEST_DIGEST = 'a'.repeat(64)
+const RESPONSE_DIGEST = 'b'.repeat(64)
+
+/** Our own record, carrying the §6.2/L-G digests a peer's fetched record
+ *  must cite for `deriveRightCellState` to land on CLOSED. Passed via
+ *  `toggleProps()` on every render -- harmless for every non-`closed` kind,
+ *  since `deriveRightCellState` never reads `localRecord` unless
+ *  `idMatch`/`signatureOk` both already came back true. */
+/** Our requested record: the digests, the node that served it, and the client
+ *  nonce both records carry -- what "Ask for their record" names the
+ *  exchange by. */
+const LOCAL_RECORD_WITH_DIGESTS: CapsuleRecord = (() => {
+  const body = fixtureHalfBody({ capsuleId: 'mine-1' })
+  const poc = (body.model_attestation as Record<string, Record<string, Record<string, unknown>>>).compute_attestation[
+    'x-mesh-poc-v1'
+  ]
+  poc.role = 'requested'
+  poc.client_nonce = 'nonce-mine-1'
+  return body as CapsuleRecord
+})()
+
+/** Settles asks against the record every test row passes as ours. */
+const settleRowAsk = (previous: RowAsk | null, outcome: AskOutcome) =>
+  settleRowAskWith(previous, outcome, LOCAL_RECORD_WITH_DIGESTS)
+
+// finding 1: `ExchangeStreamRow`
+// now derives its own right-cell state from `row.raw` + a live
+// `usePeerLedgerRecompute` fetch, ignoring any `rightCellState` a caller
+// stuffs into the row prop directly (that field is only ever the ledger's
+// at-rest default, never something a component trusts for CLOSED/
+// CONTRADICTED). Mocked here so component tests can still drive every
+// state, including the two ('closed'/'contradicted') that structurally
+// require a resolved fetch this render-only harness never performs for
+// real.
+vi.mock('@/features/capsules/lib/recompute-identity', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/features/capsules/lib/recompute-identity')>()
+  return {
+    ...actual,
+    usePeerLedgerRecompute: vi.fn(),
+    useRecomputedIdentity: vi.fn(actual.useRecomputedIdentity)
+  }
+})
+
+const NOT_FETCHED: PeerRecomputeState = {
+  status: 'not_fetched',
+  idMatch: null,
+  signatureOk: null,
+  peerRecord: null,
+  fetch: vi.fn()
+}
+
+/** The `raw.theirs` shape and mocked fetch outcome that together make
+ *  `deriveRightCellState` land on exactly `kind`, mirroring the real
+ *  producer/fetch combinations `exchange-row-state.test.ts` exercises at
+ *  the pure-function level. */
+function fixturesFor(kind: RightCellStateKind): { theirs: PaneCRow['theirs']; recompute: PeerRecomputeState } {
+  switch (kind) {
+    case 'closed':
+      return {
+        theirs: { state: 'NOT_CHECKED', capsule_id: 'a'.repeat(64), peer_id: 'peer-1' },
+        recompute: {
+          ...NOT_FETCHED,
+          status: 'found',
+          idMatch: true,
+          signatureOk: true,
+          peerRecord: fixtureHalfBody({ capsuleId: 'a'.repeat(64) })
+        }
+      }
+    case 'contradicted':
+      return {
+        theirs: { state: 'NOT_CHECKED', capsule_id: 'a'.repeat(64), peer_id: 'peer-1' },
+        // A verified record from the node that served us, with another answer.
+        recompute: {
+          ...NOT_FETCHED,
+          status: 'found',
+          idMatch: true,
+          signatureOk: true,
+          peerRecord: fixtureHalfBody({ capsuleId: 'a'.repeat(64), responseDigest: 'e'.repeat(64) })
+        }
+      }
+    case 'open_refused':
+      return {
+        theirs: {
+          state: 'absent',
+          capsule_id: null,
+          evidence_outcome: 'signed_refusal',
+          evidence_outcome_date: '4 Sep'
+        },
+        recompute: NOT_FETCHED
+      }
+    case 'open_absent':
+      return {
+        theirs: {
+          state: 'absent',
+          capsule_id: null,
+          evidence_outcome: 'recorded_absence',
+          evidence_outcome_date: '4 Sep'
+        },
+        recompute: NOT_FETCHED
+      }
+    case 'open_asked':
+      return {
+        theirs: { state: 'absent', capsule_id: null, evidence_outcome: 'unanswered', evidence_outcome_date: '4 Sep' },
+        recompute: NOT_FETCHED
+      }
+    case 'open_not_held':
+      return {
+        theirs: { state: 'NOT_CHECKED', capsule_id: 'a'.repeat(64), peer_id: 'peer-1' },
+        recompute: NOT_FETCHED
+      }
+    case 'open_not_given':
+      // Present peer, but only a non-digest self-minted correlation marker --
+      // nothing fetchable.
+      return {
+        theirs: { state: 'NOT_CHECKED', capsule_id: 'capsule-chatcmpl-1', peer_id: 'peer-1' },
+        recompute: NOT_FETCHED
+      }
+    case 'open_not_asked':
+      return { theirs: { state: 'absent', capsule_id: null }, recompute: NOT_FETCHED }
+    default: {
+      const exhaustiveCheck: never = kind
+      return exhaustiveCheck
+    }
+  }
+}
+
+function makeRow(kind: RightCellStateKind, overrides: Partial<ExchangeLedgerRow> = {}): ExchangeLedgerRow {
+  const { theirs, recompute } = fixturesFor(kind)
+  vi.mocked(usePeerLedgerRecompute).mockReturnValue(recompute)
+  return {
+    exchangeKey: `exch-${kind}`,
+    timestamp: '2026-09-08T16:58:05Z',
+    roleTag: 'ASKED',
+    counterparty: 'node:aa11bb22',
+    confirmed: kind === 'closed',
+    localOnly: false,
+    hasIssue: kind === 'contradicted',
+    checksText: '—',
+    rightCellState: {
+      kind,
+      date: kind === 'open_refused' || kind === 'open_absent' || kind === 'open_asked' ? '4 Sep' : null
+    },
+    sessionId: null,
+    twinBracketId: null,
+    contentToggleState: { your: { kind: 'populated', date: null }, their: { kind: 'not_asked', date: null } },
+    raw: {
+      mine: { state: 'present', capsule_id: 'mine-1' },
+      theirs
+    } as PaneCRow,
+    ...overrides
+  }
+}
+
+/** Our record when it names no other side: nothing to ask, whatever the time. */
+const RECORD_NAMING_NO_PEER: CapsuleRecord = fixtureHalfBody({
+  capsuleId: 'mine-1',
+  servedBy: 'unknown'
+}) as CapsuleRecord
+
+const NO_RAIL: RailSegment = { hasRail: false, isSegmentStart: false }
+
+/** Every test needs these two now that the modal is gone -- named to make
+ *  call sites read like "row props", not boilerplate. */
+function toggleProps() {
+  return {
+    localRecord: LOCAL_RECORD_WITH_DIGESTS,
+    onToggleChecks: vi.fn(),
+    onToggleContent: vi.fn(),
+    onAskForRecord: vi.fn(),
+    onAskForHistory: vi.fn()
+  }
+}
+
+describe('ExchangeStreamRow — a served exchange with no other side', () => {
+  const localRow = () =>
+    makeRow('open_not_asked', { roleTag: 'SERVED', counterparty: null, localOnly: true })
+
+  it('is badged LOCAL ("this node only"), muted, never OPEN', () => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={RECORD_NAMING_NO_PEER}
+        rail={NO_RAIL}
+        row={localRow()}
+      />
+    )
+    const badge = screen.getByText('No other side')
+    expect(badge.closest('[data-row-tone]')).toHaveAttribute('data-row-tone', 'muted')
+    expect(screen.queryByText(/^OPEN/)).not.toBeInTheDocument()
+    expect(screen.getByText('Local — no other side')).toBeInTheDocument()
+    expect(document.querySelector('[data-bracket-strip="true"]')).toHaveTextContent('Theirs ○ no other side')
+    expect(screen.getByRole('button', { name: /the No other side state/i })).toBeInTheDocument()
+  })
+
+  /** A served row with no counterparty and no ask target, classified by the
+   *  real `buildExchangeLedgerRows` (never a hand-set `localOnly`). */
+  const classifiedServedRow = (providerSettlement: PaneCRow['provider_settlement']) => {
+    const base = makeRow('open_not_asked')
+    const raw = {
+      ...base.raw,
+      exchange_key: base.exchangeKey,
+      timestamp: base.timestamp,
+      role_tag: 'SERVED',
+      counterparty: null,
+      has_issue: false,
+      provider_settlement: providerSettlement
+    } as PaneCRow
+    const [row] = buildExchangeLedgerRows([raw], new Map(), new Map([['mine-1', RECORD_NAMING_NO_PEER]]))
+    return row
+  }
+  const renderClassified = (row: ExchangeLedgerRow) =>
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={RECORD_NAMING_NO_PEER}
+        rail={NO_RAIL}
+        row={row}
+      />
+    )
+
+  it('a row served for pay with no payer recorded is OPEN, never LOCAL or "served this yourself"', () => {
+    const row = classifiedServedRow({
+      observed_by: 'provider',
+      who_paid: 'requester',
+      state: 'settled',
+      terms_digests: ['t'.repeat(64)],
+      entries: []
+    })
+    expect(row.rightCellState.kind).toBe('open_not_asked')
+    renderClassified(row)
+    expect(screen.getByText('Waiting for theirs')).toBeInTheDocument()
+    expect(screen.queryByText('No other side')).not.toBeInTheDocument()
+    expect(screen.queryByText('Local — no other side')).not.toBeInTheDocument()
+    expect(screen.getByText('Served for pay — payer not recorded')).toBeInTheDocument()
+    // The badge's (i) says it may stay open, and why.
+    expect(screen.getAllByText(SERVED_FOR_PAY_NO_PAYER_TOOLTIP).length).toBeGreaterThan(0)
+    expect(document.body).not.toHaveTextContent(/served this yourself/)
+  })
+
+  it('the same row with no provider book is LOCAL, through the same classifier', () => {
+    renderClassified(classifiedServedRow(null))
+    expect(screen.getByText('No other side')).toBeInTheDocument()
+    expect(screen.getByText('Local — no other side')).toBeInTheDocument()
+    expect(document.body).not.toHaveTextContent(SERVED_FOR_PAY_NO_PAYER_TOOLTIP)
+  })
+
+  it('a served row that names its counterparty stays OPEN', () => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={RECORD_NAMING_NO_PEER}
+        rail={NO_RAIL}
+        row={makeRow('open_not_asked', { roleTag: 'SERVED' })}
+      />
+    )
+    expect(screen.getByText('Waiting for theirs')).toBeInTheDocument()
+    expect(screen.queryByText('No other side')).not.toBeInTheDocument()
+  })
+})
+
+describe('ExchangeStreamRow — L-A/L-B alarm styling', () => {
+  it('L-B: CONTRADICTED renders the bad tone (alarm)', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('contradicted')} />)
+    const badge = screen.getByText('Disagree')
+    expect(badge.style.color).toBe('var(--color-bad-text)')
+  })
+
+  it('L-A: every OPEN state renders the neutral/muted tone, never bad', () => {
+    const openStatuses: Array<[RightCellStateKind, string]> = [
+      ['open_refused', 'Declined'],
+      ['open_absent', 'They have no record'],
+      ['open_asked', 'Asked, no reply'],
+      ['open_not_given', 'Waiting for theirs'],
+      ['open_not_asked', 'Waiting for theirs']
+    ]
+    for (const [kind, status] of openStatuses) {
+      const { unmount } = render(
+        <ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow(kind)} />
+      )
+      const badge = screen.getByText(status)
+      expect(badge.style.color).not.toBe('var(--color-bad-text)')
+      unmount()
+    }
+  })
+
+  it('L-A: CLOSED also renders the neutral tone, never bad', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />)
+    const badge = screen.getByText('Confirmed')
+    expect(badge.style.color).not.toBe('var(--color-bad-text)')
+  })
+})
+
+describe('ExchangeStreamRow — the states render distinct text/status/action', () => {
+  // `ask` is the record ask's label; every row also carries "Ask for their
+  // history", and a contradicted row carries Compare.
+  // `verdict` is the plain line on the face; `detail` the state's longer
+  // sentence, now behind the verdict's (i) (null when the face already says it).
+  const cases: Array<{
+    kind: RightCellStateKind
+    verdict: string
+    detail: string | null
+    status: string
+    /** null: the row's face is not "Waiting for their record", so it offers no ask for it. */
+    ask: string | null
+    compare?: boolean
+  }> = [
+    {
+      kind: 'contradicted',
+      verdict: '✗ Their record disagrees with yours',
+      detail: null,
+      status: 'Disagree',
+      ask: null,
+      compare: true
+    },
+    {
+      kind: 'open_refused',
+      verdict: 'They declined',
+      detail: 'They declined, and signed the refusal — 4 Sep.',
+      status: 'Declined',
+      ask: null
+    },
+    {
+      kind: 'open_absent',
+      verdict: 'They say they have no record of this — 4 Sep',
+      detail: null,
+      status: 'They have no record',
+      ask: null
+    },
+    {
+      kind: 'open_asked',
+      verdict: 'Waiting for their record',
+      detail: 'Asked 4 Sep. No verified reply yet.',
+      status: 'Asked, no reply',
+      ask: 'Ask again for their record'
+    },
+    {
+      kind: 'open_not_given',
+      verdict: 'Waiting for their record',
+      detail: 'Their record hasn’t arrived yet.',
+      status: 'Waiting for theirs',
+      ask: 'Ask for their record'
+    },
+    {
+      kind: 'open_not_asked',
+      verdict: 'Waiting for their record',
+      detail: 'Their record hasn’t arrived yet.',
+      status: 'Waiting for theirs',
+      ask: 'Ask for their record'
+    }
+  ]
+
+  for (const { kind, verdict, detail, status, ask, compare } of cases) {
+    it(`renders ${kind} correctly`, () => {
+      const { unmount } = render(<ExchangeStreamRow {...toggleProps()} rail={NO_RAIL} row={makeRow(kind)} />)
+      expect(document.querySelector('[data-row-verdict-text]')).toHaveTextContent(verdict)
+      const info = document.querySelector('[data-verdict-detail]')
+      if (detail) expect(info).toHaveTextContent(detail)
+      else expect(info).toBeNull()
+      expect(screen.getByText(status)).toBeInTheDocument()
+      // no whole-row click target and no modal left to open -- every row
+      // carries the two toggles, the state (i), the whole-row (i) and its two
+      // asks, plus Compare on a row whose records disagree, and the
+      // verdict's (i) when there is more to say than the verdict.
+      if (ask) expect(screen.getByRole('button', { name: ask })).toBeEnabled()
+      else expect(screen.queryByRole('button', { name: /for their record/ })).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Ask for their history' })).toBeEnabled()
+      if (compare) expect(screen.getByRole('button', { name: 'Compare' })).toBeEnabled()
+      expect(screen.getAllByRole('button')).toHaveLength((ask ? 6 : 5) + (compare ? 1 : 0) + (detail ? 1 : 0))
+      unmount()
+    })
+  }
+
+  it('UX §3: a CLOSED row says it in a sentence on the face; the per-property cells lead the expansion', () => {
+    const { rerender } = render(
+      <ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />
+    )
+    expect(screen.getByText('Confirmed')).toBeInTheDocument()
+    // The plain verdict names the node our record names; the longer
+    // sentence sits behind its (i).
+    expect(document.querySelector('[data-row-verdict-text]')).toHaveTextContent(
+      `✓ You and ${FIXTURE_PROVIDER_NODE.slice(0, 10)} recorded the same exchange`
+    )
+    expect(document.querySelector('[data-verdict-detail]')).toHaveTextContent('✓ They recorded the same request and answer.')
+    // Collapsed: no engineer cells on the face -- the two toggles, the
+    // state (i), the whole-row (i), the verdict's (i) and the two asks only.
+    expect(screen.queryByText('signature ✓')).not.toBeInTheDocument()
+    expect(screen.getAllByRole('button')).toHaveLength(6)
+    expect(screen.queryByRole('button', { name: /for their record/ })).not.toBeInTheDocument()
+
+    rerender(
+      <ExchangeStreamRow checksExpanded  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />
+    )
+    // The four cells: their id · signature ✓ · request = · response = --
+    // each restating a fact the gate's own inputs established -- first in
+    // the expansion, ahead of the checks panel.
+    const head = document.querySelector('[data-expansion-head="true"]') as HTMLElement
+    expect(within(head).getByText(`their id ${'a'.repeat(12)}…`)).toBeInTheDocument()
+    expect(within(head).getByText('signature ✓')).toBeInTheDocument()
+    expect(within(head).getByText('request =')).toBeInTheDocument()
+    expect(within(head).getByText('response =')).toBeInTheDocument()
+    const firstCell = head.querySelector('[data-closed-property-cell]') as HTMLElement
+    expect(firstCell).toHaveAttribute('data-closed-property-cell', 'their_id')
+    // Opening Logs at this exchange needs a host hook, so the
+    // expansion says so in plain text, never a dead link.
+    expect(within(head).getByText(SEE_IN_LOGS_NOT_ON_THIS_PAGE)).toBeInTheDocument()
+    expect(within(head).queryByRole('button', { name: /see in Logs/ })).not.toBeInTheDocument()
+    // Pointing Chat at one node needs a host hook: no such button here.
+    expect(within(head).queryByRole('button', { name: 'Chat with this node' })).not.toBeInTheDocument()
+  })
+
+  it('UX §8: each CLOSED property cell carries its own one-sentence (i)', () => {
+    render(
+      <ExchangeStreamRow checksExpanded  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />
+    )
+    const expected: Array<[string, string]> = [
+      [`their id ${'a'.repeat(12)}…`, 'The id of their record; it’s a fingerprint of the record itself.'],
+      ['signature ✓', 'Signed with this peer’s signing key, as this node knows it.'],
+      ['request =', 'The same request as in your record.'],
+      ['response =', 'The same answer as in your record.']
+    ]
+    for (const [label, sentence] of expected) {
+      const glyph = screen.getByRole('button', { name: `About ${label}` })
+      expect(document.getElementById(glyph.getAttribute('aria-describedby') as string)).toHaveTextContent(sentence)
+    }
+  })
+
+  it('D4(d) ADVERSARIAL: the per-property cells render ONLY on a gate-closed row — an OPEN row never borrows them', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_held')} />)
+    expect(screen.queryByText('signature ✓')).not.toBeInTheDocument()
+    expect(screen.queryByText('request =')).not.toBeInTheDocument()
+  })
+
+  it('Item 4: the state carries an (i) whose aria-describedby holds the fuller story (terse cell on the face)', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />)
+    // Terse status on the face.
+    expect(screen.getByText('Confirmed')).toBeInTheDocument()
+    // The (i), wired to the fuller CLOSED story.
+    const glyph = screen.getByRole('button', { name: 'About the Confirmed state' })
+    const description = document.getElementById(glyph.getAttribute('aria-describedby') as string)
+    expect(description).toHaveTextContent('They sent their own signed record of this exchange')
+    expect(description).toHaveTextContent('same request, answer and model weights as yours')
+  })
+
+  it('Item 4: a Waiting for theirs state says their record has not arrived yet, behind its (i)', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_held')} />)
+    const glyph = screen.getByRole('button', { name: 'About the Waiting for theirs state' })
+    const description = document.getElementById(glyph.getAttribute('aria-describedby') as string)
+    expect(description).toHaveTextContent('Their record hasn’t arrived')
+  })
+
+  it('LOAD-BEARING: not-asked and unanswered render visibly distinct text on the row', () => {
+    const { unmount: unmountA } = render(
+      <ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_asked')} />
+    )
+    const notAskedText = screen.getByText('Their record hasn’t arrived yet.').textContent
+    unmountA()
+    const { unmount: unmountB } = render(
+      <ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('open_asked')} />
+    )
+    const unansweredText = screen.getByText(/No verified reply yet\.$/).textContent
+    unmountB()
+    expect(notAskedText).not.toBe(unansweredText)
+  })
+})
+
+describe('ExchangeStreamRow — bilateral-retention-decay-property (agent-action-capsule @7f8a78d8, ratified 2026-09-23): one-half-unavailable renders the honest OPEN sub-state, never CONTRADICTED, never CLOSED/"attested by both"', () => {
+  it('not_found (peer legitimately holds nothing -- retention decay or never held) renders OPEN · not held', () => {
+    const row = makeRow('open_not_held')
+    vi.mocked(usePeerLedgerRecompute).mockReturnValue({
+      status: 'not_found',
+      idMatch: null,
+      signatureOk: null,
+      peerRecord: null,
+      fetch: vi.fn()
+    })
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={row} />)
+    expect(screen.getByText('Waiting for theirs')).toBeInTheDocument()
+    expect(screen.queryByText('Disagree')).not.toBeInTheDocument()
+    expect(screen.queryByText('Confirmed')).not.toBeInTheDocument()
+  })
+
+  it('error (transport/verification failure -- not a disagreement) renders OPEN · not held, never CONTRADICTED', () => {
+    const row = makeRow('open_not_held')
+    vi.mocked(usePeerLedgerRecompute).mockReturnValue({
+      status: 'error',
+      idMatch: null,
+      signatureOk: null,
+      peerRecord: null,
+      errorMessage: 'transport error',
+      fetch: vi.fn()
+    })
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={row} />)
+    expect(screen.getByText('Waiting for theirs')).toBeInTheDocument()
+    expect(screen.queryByText('Disagree')).not.toBeInTheDocument()
+  })
+
+  it('MUTANT: the only shape this row ever renders CONTRADICTED for is a completed fetch whose recomputed id demonstrably disagrees -- every other unavailable shape must go red if it starts reading CONTRADICTED', () => {
+    const row = makeRow('open_not_held')
+    const unavailableShapes: PeerRecomputeState[] = [
+      { status: 'not_fetched', idMatch: null, signatureOk: null, peerRecord: null, fetch: vi.fn() },
+      { status: 'fetching', idMatch: null, signatureOk: null, peerRecord: null, fetch: vi.fn() },
+      { status: 'not_found', idMatch: null, signatureOk: null, peerRecord: null, fetch: vi.fn() },
+      { status: 'error', idMatch: null, signatureOk: null, peerRecord: null, fetch: vi.fn() },
+      { status: 'found', idMatch: null, signatureOk: null, peerRecord: { x: 1 }, fetch: vi.fn() }
+    ]
+    for (const recompute of unavailableShapes) {
+      vi.mocked(usePeerLedgerRecompute).mockReturnValue(recompute)
+      const { unmount } = render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={row} />)
+      expect(screen.queryByText('Disagree')).not.toBeInTheDocument()
+      unmount()
+    }
+  })
+})
+
+describe('ExchangeStreamRow — counterparty field', () => {
+  it('renders the pane’s counterparty when our record names no node', () => {
+    render(<ExchangeStreamRow {...toggleProps()} localRecord={null} rail={NO_RAIL} row={makeRow('closed')} />)
+    expect(screen.getByText('node:aa11bb22')).toBeInTheDocument()
+    expect(screen.queryByText('other side not recorded')).not.toBeInTheDocument()
+  })
+
+  it('one row names one peer: the event line and the verdict both name the node our record names', () => {
+    // The pane's label is a signing key; our record names the node.
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        rail={NO_RAIL}
+        row={makeRow('closed', { counterparty: 'key:63fd6be86ed33725' })}
+      />
+    )
+    const short = FIXTURE_PROVIDER_NODE.slice(0, 10)
+    expect(document.querySelector('[data-event-line]')).toHaveTextContent(`You asked ${short}`)
+    expect(document.querySelector('[data-row-verdict-text]')).toHaveTextContent(`✓ You and ${short} recorded the same exchange`)
+    expect(screen.queryByText(/63fd6be86e/)).not.toBeInTheDocument()
+  })
+
+  it('a key: row names the node our record asked, even when their held record came from another sender', () => {
+    const sender = 'e7c7916261' + 'd'.repeat(54)
+    // Their record is held, so the pane keys the row by signing key; its
+    // sender's own word (received_from) names another node than ours does.
+    const base = makeRow('open_not_asked', { counterparty: 'key:63fd6be86ed33725' })
+    const row = {
+      ...base,
+      raw: { ...base.raw, mine: fixtureMineCell(), theirs: fixtureTheirsCell('agrees', { receivedFrom: sender }) }
+    }
+    const asked = FIXTURE_PROVIDER_NODE.slice(0, 10)
+    const peerName = (id: string) =>
+      peerNameWith(id, new Map([[asked, 'Ethans-Mac-Mini'], ['e7c7916261', 'Other-Host']]))
+    render(<ExchangeStreamRow {...toggleProps()} localRecord={null} peerName={peerName} rail={NO_RAIL} row={row} />)
+    expect(document.querySelector('[data-event-line]')).toHaveTextContent(`You asked Ethans-Mac-Mini (${asked})`)
+    expect(document.querySelector('[data-row-verdict-text]')).toHaveTextContent(
+      `✓ You and Ethans-Mac-Mini (${asked}) recorded the same exchange`
+    )
+    expect(screen.queryByText(/Other-Host|e7c7916261/)).not.toBeInTheDocument()
+  })
+
+  it('a key: counterparty resolves through Pane B’s node id when the row carries none', () => {
+    const row = makeRow('closed', { counterparty: 'key:63fd6be86ed33725' })
+    const peerName = (id: string) => peerNameWith(id, new Map([['e7c7916261', 'Ethans-Mac-Mini']]))
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        counterpartyNodeId={'e7c7916261' + 'd'.repeat(54)}
+        localRecord={null}
+        peerName={peerName}
+        rail={NO_RAIL}
+        row={row}
+      />
+    )
+    expect(document.querySelector('[data-event-line]')).toHaveTextContent('You asked Ethans-Mac-Mini (e7c7916261)')
+  })
+
+  it('ADVERSARIAL: reads "other side not recorded" — never "unknown peer", never "peer identity not resolved yet" — when unattributed', () => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={null}
+        rail={NO_RAIL}
+        row={makeRow('closed', { counterparty: null })}
+      />
+    )
+    expect(screen.getByText('other side not recorded')).toBeInTheDocument()
+    expect(screen.queryByText(/unknown peer/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/peer identity not resolved yet/i)).not.toBeInTheDocument()
+  })
+})
+
+describe('ExchangeStreamRow — a failed exchange (evidencebook#205)', () => {
+  it('says in words that the exchange failed, not that it was asked or served', () => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={RECORD_NAMING_NO_PEER}
+        rail={NO_RAIL}
+        row={makeRow('open_not_asked', { counterparty: null, roleTag: 'FAILED' })}
+      />
+    )
+    expect(screen.getByText('Exchange failed')).toBeInTheDocument()
+    expect(screen.queryByText('You asked')).not.toBeInTheDocument()
+    expect(screen.queryByText('You served')).not.toBeInTheDocument()
+    // Its own state: not the served-with-no-other-side one, and no ask is offered.
+    expect(screen.getByText('The exchange failed')).toBeInTheDocument()
+    expect(screen.queryByText('No other side')).not.toBeInTheDocument()
+    expect(screen.queryByText('Local — no other side')).not.toBeInTheDocument()
+    for (const name of ['Ask for their record']) {
+      const button = screen.getByRole('button', { name })
+      expect(button).toBeDisabled()
+      expect(button.closest('[data-census-chip]')).toHaveTextContent(
+        'The exchange failed. Failed exchanges are not shared, so there is nothing of theirs to ask for.'
+      )
+    }
+  })
+})
+
+describe('ExchangeStreamRow — a provider summary of unrecorded failures', () => {
+  it('says how many failures were not recorded', () => {
+    const base = makeRow('open_not_asked', { counterparty: null, roleTag: 'FAILED' })
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={RECORD_NAMING_NO_PEER}
+        rail={NO_RAIL}
+        row={{ ...base, raw: { ...base.raw, unsealed_failures: 3 } as never }}
+      />
+    )
+    expect(
+      screen.getByText('3 more failures from this peer in that hour were not recorded (limit 20 per hour)')
+    ).toBeInTheDocument()
+  })
+})
+
+describe('ExchangeStreamRow — counterparty gating (unaffected by the modal removal)', () => {
+  it('ASKED row, no recorded counterparty: "Other side: not known" gated text, both asks disabled with the reason', () => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={RECORD_NAMING_NO_PEER}
+        rail={NO_RAIL}
+        row={makeRow('open_not_asked', { counterparty: null })}
+      />
+    )
+    // A remote exchange whose peer is unknown/unrecorded -- there IS an other
+    // side, we just don't know it. Never the old "nothing to ask yet".
+    expect(screen.getByText('Other side: not known')).toBeInTheDocument()
+    expect(screen.queryByText('nothing to ask yet')).not.toBeInTheDocument()
+    expect(screen.queryByText('Their record hasn’t arrived yet.')).not.toBeInTheDocument()
+    // Both asks stay on the row, disabled, each saying why (never a dead click).
+    for (const name of ['Ask for their record', 'Ask for their history']) {
+      const button = screen.getByRole('button', { name })
+      expect(button).toBeDisabled()
+      expect(button.closest('[data-census-chip]')).toHaveTextContent(
+        'Your record doesn’t name the node that answered, so there is no one to ask.'
+      )
+    }
+    // The two disclosure toggles still render -- only the ask action is gated.
+    expect(screen.getByRole('button', { name: 'What was said ▸' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'How we checked ▸' })).toBeInTheDocument()
+  })
+
+  it('SERVED row, no recorded counterparty: "Local — no other side" gated text (a distinct truth from the ASKED case)', () => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={RECORD_NAMING_NO_PEER}
+        rail={NO_RAIL}
+        row={makeRow('open_not_asked', { counterparty: null, roleTag: 'SERVED' })}
+      />
+    )
+    // Served locally: no remote counterparty exists on the other side at all.
+    expect(screen.getByText('Local — no other side')).toBeInTheDocument()
+    expect(screen.queryByText('Other side: not known')).not.toBeInTheDocument()
+    expect(screen.queryByText('nothing to ask yet')).not.toBeInTheDocument()
+  })
+
+  it('no recorded counterparty on an open_asked row: gated text, the ask disabled', () => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={RECORD_NAMING_NO_PEER}
+        rail={NO_RAIL}
+        row={makeRow('open_asked', { counterparty: null })}
+      />
+    )
+    expect(screen.getByText('Other side: not known')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Ask again for their record' })).toBeDisabled()
+  })
+
+  it('a signed refusal says so and offers no ask for their record (only a waiting row does), and no "View refusal" control that does nothing', () => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        rail={NO_RAIL}
+        row={makeRow('open_refused', { counterparty: null })}
+      />
+    )
+    expect(screen.getByText('They declined')).toBeInTheDocument()
+    expect(document.querySelector('[data-verdict-detail]')).toHaveTextContent('They declined, and signed the refusal — 4 Sep.')
+    expect(screen.queryByRole('button', { name: 'View refusal' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /for their record/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Ask for their history' })).toBeEnabled()
+  })
+})
+
+describe('ExchangeStreamRow — "Ask for their record" only where their half did not arrive', () => {
+  it('a row holding both halves has no request button, confirmed or disagreeing', () => {
+    for (const kind of ['closed', 'contradicted'] as const) {
+      const { unmount } = render(<ExchangeStreamRow {...toggleProps()} rail={NO_RAIL} row={makeRow(kind)} />)
+      expect(screen.queryByRole('button', { name: /for their record/ })).not.toBeInTheDocument()
+      unmount()
+    }
+  })
+
+  it('every row that reads "Waiting for their record" offers it, and no other row does', () => {
+    for (const kind of ['open_asked', 'open_not_held', 'open_not_given', 'open_not_asked'] as const) {
+      const { unmount } = render(<ExchangeStreamRow {...toggleProps()} rail={NO_RAIL} row={makeRow(kind)} />)
+      expect(document.querySelector('[data-row-verdict-text]')).toHaveTextContent('Waiting for their record')
+      expect(screen.getByRole('button', { name: /for their record/ })).toBeInTheDocument()
+      unmount()
+    }
+    for (const kind of ['open_refused', 'open_absent'] as const) {
+      const { unmount } = render(<ExchangeStreamRow {...toggleProps()} rail={NO_RAIL} row={makeRow(kind)} />)
+      expect(screen.queryByRole('button', { name: /for their record/ })).not.toBeInTheDocument()
+      unmount()
+    }
+  })
+})
+
+describe('ExchangeStreamRow — the two row toggles replace the modal', () => {
+  it('never renders a dialog/alertdialog, in any state, expanded or not', () => {
+    for (const checksExpanded of [false, true]) {
+      for (const contentExpanded of [false, true]) {
+        const { unmount } = render(
+          <ExchangeStreamRow
+            checksExpanded={checksExpanded}
+            contentExpanded={contentExpanded}
+            
+            {...toggleProps()}
+            rail={NO_RAIL}
+            row={makeRow('closed')}
+          />
+        )
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+        expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+        unmount()
+      }
+    }
+  })
+
+  it('renders both toggles collapsed by default, independent of each other', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />)
+    const contentToggle = screen.getByRole('button', { name: 'What was said ▸' })
+    const checksToggle = screen.getByRole('button', { name: 'How we checked ▸' })
+    expect(contentToggle).toHaveAttribute('aria-expanded', 'false')
+    expect(checksToggle).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('flips its own label and aria-expanded when its prop is true, independent of the other toggle', () => {
+    render(
+      <ExchangeStreamRow checksExpanded  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />
+    )
+    expect(screen.getByRole('button', { name: 'How we checked ▾' })).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByRole('button', { name: 'What was said ▸' })).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('a CLOSED row whose own copy fails its checks says so, never a silent CLOSED', () => {
+    vi.mocked(useRecomputedIdentity).mockReturnValue({ idMatch: false, signatureOk: true })
+    try {
+      render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />)
+      expect(screen.getByText('Confirmed')).toBeInTheDocument()
+      expect(screen.getByText(/Your own copy fails its checks/)).toBeInTheDocument()
+    } finally {
+      vi.mocked(useRecomputedIdentity).mockReset()
+    }
+    // Your copy checks out: no warning.
+    vi.mocked(useRecomputedIdentity).mockReturnValue({ idMatch: true, signatureOk: true })
+    try {
+      cleanup()
+      render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />)
+      expect(screen.queryByText(/Your own copy fails its checks/)).not.toBeInTheDocument()
+    } finally {
+      vi.mocked(useRecomputedIdentity).mockReset()
+    }
+  })
+
+  it('Compare on a CONTRADICTED row opens its checks (yours beside theirs), never a silent no-op', async () => {
+    const user = userEvent.setup()
+    const onAskForRecord = vi.fn()
+    const onToggleChecks = vi.fn()
+    const row = makeRow('contradicted')
+    render(
+      <ExchangeStreamRow
+        localRecord={LOCAL_RECORD_WITH_DIGESTS}
+        onAskForRecord={onAskForRecord}
+        onToggleChecks={onToggleChecks}
+        onToggleContent={vi.fn()}
+        rail={NO_RAIL}
+        row={row}
+      />
+    )
+    await user.click(screen.getByRole('button', { name: 'Compare' }))
+    expect(onToggleChecks).toHaveBeenCalledWith(row)
+    expect(onAskForRecord).not.toHaveBeenCalled()
+  })
+
+  it('clicking `▸ content` calls onToggleContent with this row only; clicking `▸ checks` calls onToggleChecks only', async () => {
+    const user = userEvent.setup()
+    const onToggleContent = vi.fn()
+    const onToggleChecks = vi.fn()
+    const row = makeRow('closed')
+    render(
+      <ExchangeStreamRow
+        onToggleChecks={onToggleChecks}
+        onToggleContent={onToggleContent}
+        rail={NO_RAIL}
+        row={row}
+      />
+    )
+
+    await user.click(screen.getByRole('button', { name: 'What was said ▸' }))
+    expect(onToggleContent).toHaveBeenCalledWith(row)
+    expect(onToggleChecks).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('button', { name: 'How we checked ▸' }))
+    expect(onToggleChecks).toHaveBeenCalledWith(row)
+    expect(onToggleContent).toHaveBeenCalledTimes(1)
+  })
+
+  it('the ask/compare action cell button and the two toggles are independent siblings, never nested', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_asked')} />)
+    const actionButton = screen.getByRole('button', { name: 'Ask for their record' })
+    const contentToggle = screen.getByRole('button', { name: 'What was said ▸' })
+    const checksToggle = screen.getByRole('button', { name: 'How we checked ▸' })
+    expect(actionButton.contains(contentToggle)).toBe(false)
+    expect(contentToggle.contains(actionButton)).toBe(false)
+    expect(actionButton.contains(checksToggle)).toBe(false)
+  })
+
+  it('clicking the ask/compare action never fires either toggle callback', async () => {
+    const user = userEvent.setup()
+    const onToggleContent = vi.fn()
+    const onToggleChecks = vi.fn()
+    render(
+      <ExchangeStreamRow
+        localRecord={LOCAL_RECORD_WITH_DIGESTS}
+        onAskForRecord={vi.fn()}
+        
+        onToggleChecks={onToggleChecks}
+        onToggleContent={onToggleContent}
+        rail={NO_RAIL}
+        row={makeRow('open_not_asked')}
+      />
+    )
+    await user.click(screen.getByRole('button', { name: 'Ask for their record' }))
+    expect(onToggleContent).not.toHaveBeenCalled()
+    expect(onToggleChecks).not.toHaveBeenCalled()
+  })
+})
+
+describe('ExchangeStreamRow — focus/highlight/checks toggle', () => {
+  it('renders at a stable, addressable DOM id derived from the exchange key', () => {
+    const row = makeRow('closed')
+    const { container } = render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={row} />)
+    expect(container.querySelector(`#${exchangeRowDomId(row.exchangeKey)}`)).toBeInTheDocument()
+  })
+
+  it('marks the deep-link target row with aria-current and a data-highlighted flag', () => {
+    render(
+      <ExchangeStreamRow highlighted  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />
+    )
+    const rowEl = screen.getByLabelText(`Exchange ${makeRow('closed').exchangeKey}`)
+    expect(rowEl).toHaveAttribute('aria-current', 'true')
+    expect(rowEl).toHaveAttribute('data-highlighted', 'true')
+  })
+
+  it('a non-highlighted, non-focused row carries neither flag', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />)
+    const rowEl = screen.getByLabelText(`Exchange ${makeRow('closed').exchangeKey}`)
+    expect(rowEl).not.toHaveAttribute('aria-current')
+    expect(rowEl).not.toHaveAttribute('data-highlighted')
+    expect(rowEl).not.toHaveAttribute('data-focused')
+  })
+
+  it('the `c` toggle reveals the security view inline, hidden by default', () => {
+    const row = makeRow('closed')
+    const { rerender } = render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={row} />)
+    expect(screen.queryByRole('region', { name: /Security checks/ })).not.toBeInTheDocument()
+    rerender(<ExchangeStreamRow checksExpanded  {...toggleProps()} rail={NO_RAIL} row={row} />)
+    expect(screen.getByRole('region', { name: /Security checks/ })).toBeInTheDocument()
+    // Never a modal (v3 §4) -- the toggle stays inline under the row.
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+})
+
+describe('ExchangeStreamRow — UX §3: the left cell is the event in words; no leading glyph', () => {
+  it('states the role in words, and carries no unlabelled leading ◐/● glyph', () => {
+    const { unmount } = render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        rail={{ hasRail: true, isSegmentStart: true }}
+        row={makeRow('open_not_asked', { roleTag: 'SERVED' })}
+      />
+    )
+    expect(screen.getByText('You served')).toBeInTheDocument()
+    expect(screen.queryByText('◐')).not.toBeInTheDocument()
+    unmount()
+
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />)
+    expect(screen.getByText('You asked')).toBeInTheDocument()
+    expect(screen.queryByText('●')).not.toBeInTheDocument()
+  })
+
+  it('reads peer · model · tokens · duration from the record, and keeps the ids off the face', () => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={{
+          capsule_id: 'mine-1',
+          model_attestation: {
+            model_id: 'local-gguf/7089c7abcdef0123456789',
+            compute_attestation: {
+              'x-mesh-poc-v1': {
+                latency_ms: 1432,
+                serving_provenance: { usage: { prompt_tokens: 212, completion_tokens: 256 } }
+              }
+            }
+          }
+        }}
+        rail={NO_RAIL}
+        row={makeRow('closed', { counterparty: 'key:71eb7777' })}
+      />
+    )
+    const line = document.querySelector('[data-event-line="true"]') as HTMLElement
+    // The model's name, never the local-gguf/<hash> path (§3); the full
+    // reference stays on hover.
+    expect(line).toHaveTextContent('You asked key:71eb7777 · local model · 212 → 256 tokens · 1.4 s')
+    expect(line).not.toHaveTextContent('local-gguf')
+    expect(screen.queryByText('exch-closed')).not.toBeInTheDocument()
+    expect(screen.queryByText('mine-1')).not.toBeInTheDocument()
+  })
+
+  it('leaves out a duration the record never measured (latency 0), never "0 ms"', () => {
+    expect(durationText(0)).toBeNull()
+    expect(durationText('0.000')).toBeNull()
+    expect(durationText(undefined)).toBeNull()
+    expect(durationText(320)).toBe('320 ms')
+    expect(tokenFlowText(null, null)).toBeNull()
+    expect(tokenFlowText(46, 2)).toBe('46 → 2 tokens')
+    expect(tokenFlowText(34, 1)).toBe('34 → 1 token')
+  })
+
+  it('offers both asks on a fresh exchange: asking does not wait for a push', () => {
+    const fresh = new Date(Date.now() - 1_000).toISOString()
+    render(<ExchangeStreamRow {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_asked', { timestamp: fresh })} />)
+    expect(screen.getByRole('button', { name: 'Ask for their record' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Ask for their history' })).toBeEnabled()
+  })
+})
+
+describe('ExchangeStreamRow — UX §3: the bracket strip is drawn in words, without notation', () => {
+  function stripText(): string {
+    return (document.querySelector('[data-bracket-strip="true"]') as HTMLElement).textContent ?? ''
+  }
+
+  it('CLOSED: both records held, joined by a line', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />)
+    expect(stripText()).toBe('Yours ● sealed —— Theirs ● confirmed')
+  })
+
+  it('OPEN · not held: theirs is an open dot, "not received", never joined', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_held')} />)
+    expect(stripText()).toBe('Yours ● sealed   Theirs ○ not received')
+  })
+
+  it('refused / asked / contradicted / not asked each say their own word; no braces or arrows anywhere', () => {
+    const cases: Array<[RightCellStateKind, string]> = [
+      ['open_refused', 'Yours ● sealed   Theirs ○ declined'],
+      ['open_asked', 'Yours ● sealed   Theirs ○ asked, no reply yet'],
+      ['contradicted', 'Yours ● sealed —— Theirs ● disagrees'],
+      ['open_not_asked', 'Yours ● sealed   Theirs ○ not received']
+    ]
+    for (const [kind, strip] of cases) {
+      const { unmount } = render(
+        <ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow(kind)} />
+      )
+      expect(stripText()).toBe(strip)
+      expect(stripText()).not.toMatch(/[{}⟷⇄⇥⇢→◔◌⊘]/)
+      unmount()
+    }
+  })
+})
+
+describe('ExchangeStreamRow — toggle ① content', () => {
+  it('hidden by default, revealed by contentExpanded', () => {
+    const row = makeRow('closed', {
+      raw: {
+        mine: { state: 'present', capsule_id: 'mine-1', text: 'Summarise this thread…' },
+        theirs: { state: 'present', capsule_id: 'theirs-1' }
+      } as PaneCRow
+    })
+    const { rerender } = render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={row} />)
+    expect(screen.queryByText(/Summarise this thread/)).not.toBeInTheDocument()
+    rerender(<ExchangeStreamRow contentExpanded  {...toggleProps()} rail={NO_RAIL} row={row} />)
+    expect(screen.getByText(/Summarise this thread/)).toBeInTheDocument()
+  })
+
+  it('Case A (you asked): both halves render on the left; the right renders the their-claim voice', () => {
+    const row = makeRow('closed', {
+      roleTag: 'ASKED',
+      contentToggleState: {
+        your: { kind: 'populated', date: null },
+        their: { kind: 'recorded_absence', date: '4 Sep' }
+      },
+      raw: {
+        mine: {
+          state: 'present',
+          capsule_id: 'mine-1',
+          text: 'Summarise this thread…',
+          reply_text: 'The thread covers three…'
+        },
+        theirs: {
+          state: 'absent',
+          capsule_id: null,
+          evidence_outcome: 'recorded_absence',
+          evidence_outcome_date: '4 Sep'
+        }
+      } as PaneCRow
+    })
+    render(<ExchangeStreamRow contentExpanded  {...toggleProps()} rail={NO_RAIL} row={row} />)
+    const content = document.querySelector('[data-content-toggle="expanded"]') as HTMLElement
+    expect(within(content).getByText(/You asked/)).toBeInTheDocument()
+    expect(screen.getByText(/Summarise this thread/)).toBeInTheDocument()
+    expect(screen.getByText(/They streamed back/)).toBeInTheDocument()
+    expect(screen.getByText(/The thread covers three/)).toBeInTheDocument()
+    expect(screen.getByText('They state they hold no payload for this exchange — signed 4 Sep.')).toBeInTheDocument()
+  })
+
+  it('Case B (they asked, you served): the left renders the fixed fact-you-know string; the right renders "not visible to you"', () => {
+    const row = makeRow('closed', {
+      roleTag: 'SERVED',
+      contentToggleState: {
+        your: { kind: 'streamed_not_retained', date: null },
+        their: { kind: 'not_visible_holds', date: null }
+      }
+    })
+    render(<ExchangeStreamRow contentExpanded  {...toggleProps()} rail={NO_RAIL} row={row} />)
+    expect(screen.getByText('No content. You streamed this response and did not retain it.')).toBeInTheDocument()
+    expect(screen.getByText('Their content — not visible to you. The requester holds it.')).toBeInTheDocument()
+  })
+
+  it('deletion renders as a distinct state, not a blank', () => {
+    const row = makeRow('closed', {
+      roleTag: 'ASKED',
+      contentToggleState: {
+        your: { kind: 'populated_deleted', date: '5 Sep' },
+        their: { kind: 'not_asked', date: null }
+      }
+    })
+    render(<ExchangeStreamRow contentExpanded  {...toggleProps()} rail={NO_RAIL} row={row} />)
+    expect(screen.getByText('Content deleted 5 Sep · record still verifies')).toBeInTheDocument()
+  })
+
+  it('the three their-content sub-states + not-visible-holds each render distinct text', () => {
+    const cases: Array<{
+      contentToggleState: ExchangeLedgerRow['contentToggleState']
+      text: string
+    }> = [
+      {
+        contentToggleState: {
+          your: { kind: 'populated', date: null },
+          their: { kind: 'recorded_absence', date: '4 Sep' }
+        },
+        text: 'They state they hold no payload for this exchange — signed 4 Sep.'
+      },
+      {
+        contentToggleState: { your: { kind: 'populated', date: null }, their: { kind: 'not_asked', date: null } },
+        text: 'Not compared: they aren’t expected to keep the text of what was said.'
+      },
+      {
+        contentToggleState: { your: { kind: 'populated', date: null }, their: { kind: 'unanswered', date: '3 Sep' } },
+        text: 'Asked 3 Sep. No reply yet.'
+      }
+    ]
+    for (const { contentToggleState, text } of cases) {
+      const { unmount } = render(
+        <ExchangeStreamRow
+          contentExpanded
+          
+          {...toggleProps()}
+          rail={NO_RAIL}
+          row={makeRow('closed', { contentToggleState })}
+        />
+      )
+      expect(screen.getByText(text)).toBeInTheDocument()
+      unmount()
+    }
+  })
+
+  it('the never-asked their-content state offers no "Ask them to state it" control: nothing could send it', () => {
+    const row = makeRow('closed', {
+      contentToggleState: { your: { kind: 'populated', date: null }, their: { kind: 'not_asked', date: null } }
+    })
+    render(<ExchangeStreamRow contentExpanded {...toggleProps()} rail={NO_RAIL} row={row} />)
+    expect(screen.queryByRole('button', { name: 'Ask them to state it' })).not.toBeInTheDocument()
+  })
+
+  it('LOAD-BEARING (L-H): the your-empty voice and the their-empty voice are visibly different strings', () => {
+    const servedRow = makeRow('closed', {
+      roleTag: 'SERVED',
+      contentToggleState: {
+        your: { kind: 'streamed_not_retained', date: null },
+        their: { kind: 'not_visible_holds', date: null }
+      }
+    })
+    const { unmount } = render(
+      <ExchangeStreamRow contentExpanded  {...toggleProps()} rail={NO_RAIL} row={servedRow} />
+    )
+    const yourVoice = screen.getByText(/No content\. You streamed/).textContent
+    unmount()
+
+    const askedRow = makeRow('closed', {
+      roleTag: 'ASKED',
+      contentToggleState: {
+        your: { kind: 'populated', date: null },
+        their: { kind: 'recorded_absence', date: '4 Sep' }
+      }
+    })
+    render(<ExchangeStreamRow contentExpanded  {...toggleProps()} rail={NO_RAIL} row={askedRow} />)
+    const theirVoice = screen.getByText(/They state they hold no payload/).textContent
+
+    expect(yourVoice).not.toBe(theirVoice)
+  })
+})
+
+describe('ExchangeStreamRow — §3A one colour per state', () => {
+  it('a row with no held bytes (OPEN) renders no colour and the invitation to act', () => {
+    const { container } = render(
+      <ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_asked')} />
+    )
+    expect(screen.getByText('Their record hasn’t arrived yet.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Ask for their record' })).toBeInTheDocument()
+    // Exactly one tone marker on the row, and it's muted -- no colour.
+    const toneEls = container.querySelectorAll('[data-row-tone]')
+    expect(toneEls).toHaveLength(1)
+    expect(toneEls[0]).toHaveAttribute('data-row-tone', 'muted')
+  })
+
+  it('MUTANT: every OPEN state (not just open_not_asked) renders the muted/no-colour tone', () => {
+    const openKinds: RightCellStateKind[] = [
+      'open_refused',
+      'open_absent',
+      'open_asked',
+      'open_not_held',
+      'open_not_given',
+      'open_not_asked'
+    ]
+    for (const kind of openKinds) {
+      const { container, unmount } = render(
+        <ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow(kind)} />
+      )
+      const tone = container.querySelector('[data-row-tone]')?.getAttribute('data-row-tone')
+      expect(tone === 'good' || tone === 'bad', `${kind} rendered tone "${tone}"`).toBe(false)
+      unmount()
+    }
+  })
+
+  it('a CONTRADICTED row renders the bad/red tone exactly once', () => {
+    const { container } = render(
+      <ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('contradicted')} />
+    )
+    const toneEls = container.querySelectorAll('[data-row-tone]')
+    expect(toneEls).toHaveLength(1)
+    expect(container.querySelectorAll('[data-row-tone="bad"]')).toHaveLength(1)
+  })
+
+  it('a CLOSED row renders the good/green tone, not muted, not bad', () => {
+    const { container } = render(
+      <ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />
+    )
+    expect(container.querySelectorAll('[data-row-tone="good"]')).toHaveLength(1)
+    expect(container.querySelectorAll('[data-row-tone="bad"], [data-row-tone="muted"]')).toHaveLength(0)
+  })
+})
+
+describe('ExchangeStreamRow — a Confirmed badge beside a failed check on your own copy', () => {
+  it('says your own copy fails its checks, and only then', async () => {
+    const closed = makeRow('closed')
+    const tampered = { ...LOCAL_RECORD_WITH_DIGESTS, capsule_id: 'f'.repeat(64) }
+    const { rerender } = render(
+      <ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={closed} />
+    )
+    expect(screen.queryByText(OWN_RECORD_FAILS_WARNING)).not.toBeInTheDocument()
+    rerender(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={tampered}
+        rail={NO_RAIL}
+        row={closed}
+      />
+    )
+    // The fingerprint check runs asynchronously on this machine.
+    expect(await screen.findByText(OWN_RECORD_FAILS_WARNING)).toBeInTheDocument()
+  })
+})
+
+describe('ExchangeStreamRow — a confirmation the node holds because you asked', () => {
+  const pushedRow = (via: string | undefined) => {
+    const base = makeRow('open_not_asked')
+    return { ...base, raw: { ...base.raw, mine: fixtureMineCell(), theirs: { ...fixtureTheirsCell('agrees'), via } } }
+  }
+
+  it('says it was saved because you asked, for a held record that came by ask', () => {
+    render(<ExchangeStreamRow {...toggleProps()} rail={NO_RAIL} row={pushedRow('ask')} />)
+    expect(screen.getByText('Confirmed')).toBeInTheDocument()
+    expect(document.querySelector('[data-verdict-detail]')).toHaveTextContent(SAVED_BECAUSE_YOU_ASKED)
+  })
+
+  it('never for a record their node pushed', () => {
+    render(<ExchangeStreamRow {...toggleProps()} rail={NO_RAIL} row={pushedRow('push')} />)
+    expect(screen.getByText('Confirmed')).toBeInTheDocument()
+    expect(screen.queryByText(SAVED_BECAUSE_YOU_ASKED)).not.toBeInTheDocument()
+  })
+
+  it('never on a row that is not confirmed', () => {
+    const base = makeRow('open_not_held')
+    render(
+      <ExchangeStreamRow {...toggleProps()} rail={NO_RAIL} row={{ ...base, raw: { ...base.raw, theirs: { ...base.raw.theirs, via: 'ask' } } }} />
+    )
+    expect(screen.queryByText(SAVED_BECAUSE_YOU_ASKED)).not.toBeInTheDocument()
+  })
+
+  it('never says a confirmation is on this page only: an asked record is saved on the node', () => {
+    render(<ExchangeStreamRow {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />)
+    expect(screen.queryByText(/not saved on this node/)).not.toBeInTheDocument()
+  })
+})
+
+describe('ExchangeStreamRow — the referee', () => {
+  it('badges a row that is this node’s answer as a referee, and no other row', () => {
+    const referee = makeRow('open_not_asked')
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        rail={NO_RAIL}
+        row={{ ...referee, raw: { ...referee.raw, referee_call: true } }}
+      />
+    )
+    expect(screen.getByText('referee answer')).toBeInTheDocument()
+  })
+
+  it('shows a verdict delivered about this exchange on its row', () => {
+    const judged = makeRow('open_not_asked')
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        rail={NO_RAIL}
+        row={{
+          ...judged,
+          raw: {
+            ...judged.raw,
+            adjudication: {
+              verdict: 'corroborated',
+              verdict_capsule_id: 'v'.repeat(64),
+              referee_node_id: 'a70d3967bea3b22f'.repeat(4),
+              received_at: '2026-09-28T15:00:00Z',
+              about_this_node: false
+            }
+          }
+        }}
+      />
+    )
+    expect(screen.getByText('A referee (node a70d3967be…) found this answer corroborated.')).toBeInTheDocument()
+  })
+
+  it('shows no referee badge on an ordinary row', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_asked')} />)
+    expect(screen.queryByText('referee answer')).not.toBeInTheDocument()
+  })
+})
+
+describe('ExchangeStreamRow — row time', () => {
+  it('shows the exchange time in local time, never an ISO/UTC stamp', () => {
+    const { container } = render(
+      <ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />
+    )
+    const time = container.querySelector('time')
+    expect(time?.getAttribute('datetime')).toBe('2026-09-08T16:58:05Z')
+    expect(time?.textContent).toBe(formatExchangeTimestamp('2026-09-08T16:58:05Z'))
+    expect(container.textContent).not.toMatch(/\d{4}-\d\d-\d\d[T ]\d\d:\d\d|\bUTC\b|\d\dZ\b/)
+  })
+})
+
+describe('ExchangeStreamRow — three steps on the face, the chips in "How we checked"', () => {
+  it('the face shows Sealed → In a checkpoint → Confirmed by them, a step not reached greyed', () => {
+    const { rerender } = render(
+      <ExchangeStreamRow {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_asked')} />
+    )
+    const steps = () =>
+      Array.from(document.querySelectorAll('[data-row-steps] [data-step]')).map((el) => [
+        el.textContent?.replace('→', '').trim(),
+        el.getAttribute('data-reached')
+      ])
+    expect(steps()).toEqual([
+      ['Sealed', 'true'],
+      ['In a checkpoint', 'false'],
+      ['Confirmed by them', 'false']
+    ])
+    expect(document.querySelector('[data-step="checkpoint"]')).toHaveClass('text-fg-faint')
+    // The chips are not on the face.
+    expect(screen.queryByLabelText('signed: jump to that check')).not.toBeInTheDocument()
+
+    rerender(<ExchangeStreamRow {...toggleProps()} checkpointCovered rail={NO_RAIL} row={makeRow('closed')} />)
+    expect(steps().map(([, reached]) => reached)).toEqual(['true', 'true', 'true'])
+  })
+
+  it('renders the five chips in plain words inside "How we checked", never sig / inclusion / registered', () => {
+    render(<ExchangeStreamRow checksExpanded {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_asked')} />)
+    for (const label of ['words match', 'signed', 'in a checkpoint', 'witnessed', 'their record']) {
+      expect(screen.getByLabelText(`${label}: jump to that check`)).toBeInTheDocument()
+    }
+    expect(screen.getByLabelText('signed: jump to that check')).toHaveAttribute('role', 'link')
+    expect(screen.getByRole('group', { name: 'checks summary' }).textContent).not.toMatch(/\bsig\b|\binclusion\b|\bregistered\b/)
+  })
+
+  it('with the witness off, no "witnessed" chip and no witnessed step', () => {
+    const { container } = render(
+      <ExchangeStreamRow checksExpanded {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_asked')} witnessOff />
+    )
+    expect(screen.queryByLabelText('witnessed: jump to that check')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('words match: jump to that check')).toBeInTheDocument()
+    expect(container.querySelector('[data-row-steps]')?.textContent).not.toMatch(/witness/i)
+  })
+
+  it('Compare on a collapsed panel expands checks, then scrolls to the matching property once it mounts', async () => {
+    const user = userEvent.setup()
+    const onToggleChecks = vi.fn()
+    const row = makeRow('contradicted')
+    const scrollSpy = vi.spyOn(HTMLElement.prototype, 'scrollIntoView')
+
+    const { rerender } = render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        onToggleChecks={onToggleChecks}
+        rail={NO_RAIL}
+        row={row}
+      />
+    )
+    await user.click(screen.getByRole('button', { name: 'Compare' }))
+    expect(onToggleChecks).toHaveBeenCalledWith(row)
+    expect(scrollSpy).not.toHaveBeenCalled()
+
+    // The parent (LedgerPage) honors the toggle -- checksExpanded flips true.
+    rerender(
+      <ExchangeStreamRow
+        checksExpanded
+        {...toggleProps()}
+        onToggleChecks={onToggleChecks}
+        rail={NO_RAIL}
+        row={row}
+      />
+    )
+    expect(await screen.findByRole('region', { name: /Security checks/ })).toBeInTheDocument()
+    expect(scrollSpy).toHaveBeenCalled()
+    scrollSpy.mockRestore()
+  })
+
+  it('a chip click while the panel is already expanded scrolls immediately, without re-toggling', async () => {
+    const user = userEvent.setup()
+    const onToggleChecks = vi.fn()
+    const scrollSpy = vi.spyOn(HTMLElement.prototype, 'scrollIntoView')
+
+    render(
+      <ExchangeStreamRow
+        checksExpanded
+        
+        {...toggleProps()}
+        onToggleChecks={onToggleChecks}
+        rail={NO_RAIL}
+        row={makeRow('open_not_asked')}
+      />
+    )
+    await user.click(screen.getByLabelText('words match: jump to that check'))
+    expect(onToggleChecks).not.toHaveBeenCalled()
+    expect(scrollSpy).toHaveBeenCalled()
+    scrollSpy.mockRestore()
+  })
+})
+
+describe('ExchangeStreamRow — §3A model identity + short/copyable ids', () => {
+  afterEach(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined })
+  })
+
+  it('renders the model by name, with the full ref on hover, when the record carries one', () => {
+    const row = makeRow('closed')
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={{
+          capsule_id: 'mine-1',
+          effect: { request_digest: REQUEST_DIGEST, response_digest: RESPONSE_DIGEST },
+          model_attestation: { model_id: 'local-gguf/7089c7abcdef0123456789' }
+        }}
+        rail={NO_RAIL}
+        row={row}
+      />
+    )
+    const modelEl = screen.getByText('local model')
+    expect(modelEl).toHaveAttribute('title', 'local-gguf/7089c7abcdef0123456789')
+  })
+
+  it('names the model and counts from the other side’s record when ours has none, and says whose they are', () => {
+    const row = makeRow('closed')
+    row.raw.theirs.record = {
+      capsule_id: 'theirs-1',
+      model_attestation: {
+        model_id: 'local-gguf/abc',
+        compute_attestation: {
+          'x-mesh-poc-v1': {
+            latency_ms: '2300.000',
+            serving_provenance: {
+              architecture: 'llama',
+              parameter_size: '3B',
+              usage: { prompt_tokens: 12, completion_tokens: 40 }
+            }
+          }
+        }
+      }
+    }
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        localRecord={{ capsule_id: 'mine-1', model_attestation: { model_id: 'local-gguf/abc' } }}
+        rail={NO_RAIL}
+        row={row}
+      />
+    )
+    const line = document.querySelector('[data-event-line="true"]') as HTMLElement
+    expect(line).toHaveTextContent('12 → 40 tokens (their count)')
+    expect(line).toHaveTextContent('2.3 s (their measure)')
+  })
+
+  it('a CLOSED row says where their record sits in their log, once our records cite it', () => {
+    const row = makeRow('closed')
+    row.raw.theirs.in_their_log = { leaf_index: 6, checkpoint_leaves: 8 }
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={row} />)
+    // No number: their checkpoint's leaves include their padding.
+    expect(screen.getByText('Confirmed · in their log')).toBeInTheDocument()
+    expect(screen.queryByText(/checkpoint 8|8 records/)).not.toBeInTheDocument()
+  })
+
+  it('shows the time in the viewer’s own zone, never an ISO/UTC stamp', () => {
+    expect(formatExchangeTimestamp('2026-09-28T04:56:00Z')).not.toMatch(/Z$|T\d/)
+    expect(formatExchangeTimestamp(null)).toBe('timestamp unavailable')
+  })
+
+  it('drops a sha256- algorithm prefix before shortening -- never "local-gguf/sha256…"', () => {
+    expect(formatModelIdentity('local-gguf/sha256-6c1a2b41161032677be168d354123594')).toBe('local-gguf/6c1a2b…')
+  })
+
+  it('renders nothing for the model when the record carries no model ref -- never a placeholder', () => {
+    render(<ExchangeStreamRow  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />)
+    expect(screen.queryByText(/local-gguf/)).not.toBeInTheDocument()
+  })
+
+  it('a short exchange key/record id renders unchanged in the expansion (never truncated for an already-short id)', () => {
+    render(
+      <ExchangeStreamRow checksExpanded  {...toggleProps()} rail={NO_RAIL} row={makeRow('closed')} />
+    )
+    const head = document.querySelector('[data-expansion-head="true"]') as HTMLElement
+    expect(within(head).getByText('exch-closed')).toBeInTheDocument()
+    expect(within(head).getByText('mine-1')).toBeInTheDocument()
+  })
+
+  it('a long (real digest-shaped) exchange key renders short, with the full string on hover and copy', async () => {
+    const user = userEvent.setup()
+    const longKey = 'e'.repeat(64)
+    const writeText = vi.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    render(
+      <ExchangeStreamRow
+        checksExpanded
+        
+        {...toggleProps()}
+        rail={NO_RAIL}
+        row={makeRow('closed', { exchangeKey: longKey })}
+      />
+    )
+    expect(screen.queryByText(longKey)).not.toBeInTheDocument()
+    const shortEl = screen.getByText('eeee…eeee')
+    expect(shortEl).toHaveAttribute('title', longKey)
+    await user.click(shortEl)
+    expect(writeText).toHaveBeenCalledWith(longKey)
+  })
+})
+
+describe('ExchangeStreamRow — whether the record an ask brought was saved on this node', () => {
+  const askedRecord = (saved: boolean | undefined) => {
+    const theirs = { ...LOCAL_RECORD_WITH_DIGESTS, capsule_id: 'theirs-1' } as Record<string, unknown>
+    return settleRowAsk(null, {
+      kind: 'record',
+      at: '2026-09-28T23:00:00Z',
+      evidence: { status: 'found', idMatch: true, signatureOk: true, peerRecord: theirs, fetch: vi.fn() },
+      ...(saved === undefined ? {} : { saved })
+    })
+  }
+
+  it('saved (its id in the tool’s held): Confirmed, and no "couldn’t save" line', () => {
+    render(<ExchangeStreamRow {...toggleProps()} askOutcome={askedRecord(true)} rail={NO_RAIL} row={makeRow('open_not_given')} />)
+    expect(screen.getByText('Confirmed')).toBeInTheDocument()
+    expect(screen.queryByText(new RegExp(CONFIRMED_NOT_KEPT))).not.toBeInTheDocument()
+  })
+
+  it('not saved (held empty or missing): still Confirmed on the face, and its (i) says a reload won’t keep it', () => {
+    render(<ExchangeStreamRow {...toggleProps()} askOutcome={askedRecord(false)} rail={NO_RAIL} row={makeRow('open_not_given')} />)
+    expect(screen.getByText('Confirmed')).toBeInTheDocument()
+    expect(document.querySelector('[data-row-verdict-text]')).toHaveTextContent('recorded the same exchange')
+    expect(document.querySelector('[data-verdict-detail]')).toHaveTextContent(CONFIRMED_NOT_KEPT)
+    expect(screen.queryByText(SAVED_BECAUSE_YOU_ASKED)).not.toBeInTheDocument()
+  })
+
+  it('a record the node holds (pushed) is never said to be unsaved, even beside an unsaved ask', () => {
+    const base = makeRow('open_not_asked')
+    const pushed = { ...base, raw: { ...base.raw, mine: fixtureMineCell(), theirs: { ...fixtureTheirsCell('agrees'), via: 'ask' } } }
+    render(<ExchangeStreamRow {...toggleProps()} askOutcome={askedRecord(false)} rail={NO_RAIL} row={pushed} />)
+    expect(document.querySelector('[data-verdict-detail]')).toHaveTextContent(SAVED_BECAUSE_YOU_ASKED)
+    expect(document.querySelector('[data-verdict-detail]')?.textContent).not.toContain(CONFIRMED_NOT_KEPT)
+  })
+})
+
+describe('ExchangeStreamRow — a row closed from the record "Ask for their record" brought', () => {
+  it('reads Confirmed, and its (i) says the reply was verified, never that it isn’t saved', () => {
+    const theirs = { ...LOCAL_RECORD_WITH_DIGESTS, capsule_id: 'theirs-1' } as Record<string, unknown>
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        askOutcome={settleRowAsk(null, {
+          kind: 'record',
+          at: '2026-09-28T23:00:00Z',
+          witness: 'witnessed',
+          evidence: { status: 'found', idMatch: true, signatureOk: true, peerRecord: theirs, fetch: vi.fn() }
+        })}
+        rail={NO_RAIL}
+        row={makeRow('open_not_given')}
+      />
+    )
+    expect(screen.getByText('Confirmed')).toBeInTheDocument()
+    expect(document.querySelector('[data-verdict-detail]')).toHaveTextContent('Their reply is verified')
+    expect(screen.queryByText(/not saved/)).not.toBeInTheDocument()
+  })
+})
+
+describe('ExchangeStreamRow — whether their reply to "Ask for their record" was verified', () => {
+  it('says a reply the plugin could not verify is not verified, and why', () => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        askOutcome={settleRowAsk(null, {
+          kind: 'no_reply',
+          at: '2026-09-28T23:00:00Z',
+          detail: 'their reply did not verify: a proof does not verify against the anchor'
+        })}
+        rail={NO_RAIL}
+        row={makeRow('open_not_given')}
+      />
+    )
+    const note = document.querySelector('[data-ask-reply-verified]') as HTMLElement
+    expect(note).toHaveAttribute('data-ask-reply-verified', 'false')
+    expect(note).toHaveTextContent('No verified reply (their reply did not verify: a proof does not verify against the anchor).')
+  })
+
+  it('says a record the plugin proved in their log, under a checkpoint a trusted witness holds, is verified', () => {
+    const theirs = { ...LOCAL_RECORD_WITH_DIGESTS, capsule_id: 'theirs-1' } as Record<string, unknown>
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        askOutcome={settleRowAsk(null, {
+          kind: 'record',
+          at: '2026-09-28T23:00:00Z',
+          witness: 'witnessed',
+          evidence: { status: 'found', idMatch: true, signatureOk: true, peerRecord: theirs, fetch: vi.fn() }
+        })}
+        rail={NO_RAIL}
+        row={makeRow('open_not_given')}
+      />
+    )
+    const note = document.querySelector('[data-ask-reply-verified]') as HTMLElement
+    expect(note).toHaveAttribute('data-ask-reply-verified', 'true')
+    expect(note).toHaveAttribute('data-ask-reply-witness', 'witnessed')
+    expect(note).toHaveTextContent('Their reply is verified')
+    expect(note).toHaveTextContent('a witness this node trusts holds their checkpoint')
+  })
+
+  it.each([
+    ['unwitnessed', 'no witness this node trusts has vouched for that log'],
+    ['no_witness', 'This node has no witness configured to check it against']
+  ] as const)(
+    'a record no trusted witness vouches for (%s) still reads Confirmed, but its reply line never says verified',
+    (witness, clause) => {
+      const theirs = { ...LOCAL_RECORD_WITH_DIGESTS, capsule_id: 'theirs-1' } as Record<string, unknown>
+      render(
+        <ExchangeStreamRow
+          {...toggleProps()}
+          askOutcome={settleRowAsk(null, {
+            kind: 'record',
+            at: '2026-09-28T23:00:00Z',
+            witness,
+            evidence: { status: 'found', idMatch: true, signatureOk: true, peerRecord: theirs, fetch: vi.fn() }
+          })}
+          rail={NO_RAIL}
+          row={makeRow('open_not_given')}
+        />
+      )
+      expect(screen.getByText('Confirmed')).toBeInTheDocument()
+      const note = document.querySelector('[data-ask-reply-verified]') as HTMLElement
+      expect(note).toHaveAttribute('data-ask-reply-verified', 'false')
+      expect(note).toHaveAttribute('data-ask-reply-witness', witness)
+      expect(note).toHaveTextContent('Their record checks against their own signatures only')
+      expect(note).toHaveTextContent(clause)
+      // The row's own Confirmed sentence keeps its ✓; nothing beside it says
+      // the reply was verified or checks out.
+      const detail = document.querySelector('[data-verdict-detail]')?.textContent ?? ''
+      expect(detail).not.toMatch(/checks out|verified/i)
+    }
+  )
+
+  it('never says verified for a record whose signature does not hold', () => {
+    const theirs = { ...LOCAL_RECORD_WITH_DIGESTS, capsule_id: 'theirs-1' } as Record<string, unknown>
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        askOutcome={settleRowAsk(null, {
+          kind: 'record',
+          at: '2026-09-28T23:00:00Z',
+          evidence: { status: 'found', idMatch: true, signatureOk: false, peerRecord: theirs, fetch: vi.fn() }
+        })}
+        rail={NO_RAIL}
+        row={makeRow('open_not_given')}
+      />
+    )
+    const note = document.querySelector('[data-ask-reply-verified]') as HTMLElement
+    expect(note).toHaveAttribute('data-ask-reply-verified', 'false')
+    expect(note).toHaveTextContent('it is not signed with the key this node has for them')
+  })
+
+  it('shows no note while the ask is in flight', () => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        askOutcome={settleRowAsk(null, { kind: 'asking', at: '2026-09-28T23:00:00Z' })}
+        rail={NO_RAIL}
+        row={makeRow('open_not_given')}
+      />
+    )
+    expect(document.querySelector('[data-ask-reply-verified]')).toBeNull()
+  })
+})
+
+describe('ExchangeStreamRow — the two asks on the row face', () => {
+  it('"Ask for their history" asks the node our record names, and shows the verified outcome', async () => {
+    const user = userEvent.setup()
+    const onAskForHistory = vi.fn()
+    const row = makeRow('open_not_held')
+    const { rerender } = render(
+      <ExchangeStreamRow {...toggleProps()} onAskForHistory={onAskForHistory} rail={NO_RAIL} row={row} />
+    )
+    await user.click(screen.getByRole('button', { name: 'Ask for their history' }))
+    expect(onAskForHistory).toHaveBeenCalledWith(row, FIXTURE_PROVIDER_NODE)
+
+    rerender(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        historyOutcome={{ kind: 'asking', at: '2026-10-22T10:00:00Z' }}
+        rail={NO_RAIL}
+        row={row}
+      />
+    )
+    expect(screen.getByRole('button', { name: 'Asking…' })).toBeDisabled()
+
+    rerender(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        historyOutcome={{ kind: 'verified', at: '2026-10-22T10:00:00Z', checkpoints: 4, witness: 'witnessed' }}
+        rail={NO_RAIL}
+        row={row}
+      />
+    )
+    expect(document.querySelector('[data-history-reply-verified="true"]')).toHaveTextContent(
+      '✓ Their history checks out · 4 checkpoints'
+    )
+    expect(document.querySelector('[data-history-checked]')).toHaveTextContent(
+      `checked ${formatExchangeTimestamp('2026-10-22T10:00:00Z')}`
+    )
+    // The face line: "✓ Their history checks out · 4 checkpoints · checked {time}";
+    // how it was checked sits behind the (i).
+    expect(document.querySelector('[data-history-reply-verified="true"]')?.firstChild?.textContent).toBe(
+      '✓ Their history checks out · 4 checkpoints'
+    )
+    expect(screen.getByRole('button', { name: 'About their history' })).toHaveAccessibleDescription(
+      'Their history is verified: 4 checkpoints of their log, each signed with the key this node has for them and each extending the one before. A witness this node trusts holds their checkpoint.'
+    )
+    expect(document.querySelector('[data-history-witness="witnessed"]')).not.toBeNull()
+    expect(screen.getByRole('button', { name: 'Ask for their history' })).toBeEnabled()
+  })
+
+  it.each([
+    ['unwitnessed', 'Their history checks against their own signatures only · 4 checkpoints', 'No witness this node trusts has vouched'],
+    ['no_witness', 'Their history checks against their own signatures only · 4 checkpoints', 'This node has no witness configured'],
+    ['not_recorded', 'Their history checked against their own signatures · 4 checkpoints', 'Its witness standing was not recorded']
+  ] as const)('a history no trusted witness vouches for (%s) is never shown as verified', (witness, face, clause) => {
+    render(
+      <ExchangeStreamRow
+        {...toggleProps()}
+        historyOutcome={{ kind: 'verified', at: '2026-10-22T10:00:00Z', checkpoints: 4, witness }}
+        rail={NO_RAIL}
+        row={makeRow('open_not_held')}
+      />
+    )
+    const line = document.querySelector('[data-history-reply-verified]') as HTMLElement
+    expect(line).toHaveAttribute('data-history-reply-verified', 'false')
+    expect(line).toHaveAttribute('data-history-witness', witness)
+    expect(line.firstChild?.textContent).toBe(face)
+    const about = screen.getByRole('button', { name: 'About their history' })
+    expect(about).toHaveAccessibleDescription(expect.stringContaining(clause))
+    expect(`${line.textContent} ${about.getAttribute('aria-description') ?? ''}`).not.toMatch(/✓|checks out|verified/i)
+  })
+
+  it('on a saved sample both asks stay visible, disabled, saying why', () => {
+    render(
+      <ExchangeStreamRow
+        localRecord={LOCAL_RECORD_WITH_DIGESTS}
+        onToggleChecks={vi.fn()}
+        onToggleContent={vi.fn()}
+        rail={NO_RAIL}
+        row={makeRow('open_not_held')}
+      />
+    )
+    for (const name of ['Ask for their record', 'Ask for their history']) {
+      const button = screen.getByRole('button', { name })
+      expect(button).toBeDisabled()
+      expect(button.closest('[data-census-chip]')).toHaveTextContent('Not available on sample data.')
+    }
+  })
+
+  it('the checkpoint chip reads covered (◐) once a checkpoint covers the record, never the "not covered" dash', () => {
+    const { rerender } = render(
+      <ExchangeStreamRow checksExpanded {...toggleProps()} rail={NO_RAIL} row={makeRow('open_not_held')} />
+    )
+    const chip = () => screen.getByLabelText('in a checkpoint: jump to that check')
+    expect(chip()).toHaveTextContent('–')
+    rerender(
+      <ExchangeStreamRow checksExpanded {...toggleProps()} checkpointCovered rail={NO_RAIL} row={makeRow('open_not_held')} />
+    )
+    expect(chip()).toHaveTextContent('◐')
+    expect(chip().closest('[data-census-chip]')).toHaveTextContent('A checkpoint on this node covers this record')
+  })
+})
+
+describe('ExchangeStreamRow — the record an ask returned feeds the state, the checks and Compare alike', () => {
+  it('a signed record with a different answer reads Disagree, and Compare opens checks that compare it', async () => {
+    const user = userEvent.setup()
+    const theirs = fixtureHalfBody({ capsuleId: 'theirs-1', responseDigest: 'e'.repeat(64) })
+    const askOutcome = settleRowAsk(null, {
+      kind: 'record',
+      at: '2026-09-28T23:00:00Z',
+      evidence: { status: 'found', idMatch: true, signatureOk: true, peerRecord: theirs, fetch: vi.fn() }
+    })
+    const onToggleChecks = vi.fn()
+    const row = makeRow('open_not_held')
+    const { rerender } = render(
+      <ExchangeStreamRow {...toggleProps()} askOutcome={askOutcome} onToggleChecks={onToggleChecks} rail={NO_RAIL} row={row} />
+    )
+    expect(screen.getByText('Disagree')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Compare' }))
+    expect(onToggleChecks).toHaveBeenCalledWith(row)
+
+    rerender(<ExchangeStreamRow {...toggleProps()} askOutcome={askOutcome} checksExpanded rail={NO_RAIL} row={row} />)
+    // Their record is the one the ask brought, compared field by field; the
+    // panel's fetch still runs a real fetch, never the asked record's no-op.
+    expect(screen.getAllByText('differs').length).toBeGreaterThan(0)
+    await user.click(screen.getByRole('button', { name: 'Get their record and check it here' }))
+    expect(NOT_FETCHED.fetch).toHaveBeenCalled()
+  })
+
+  it('a failed retry after their signed refusal keeps the refusal, and says the retry failed', () => {
+    let ask = settleRowAsk(null, { kind: 'refused', at: '2026-09-28T23:00:00Z', reason: 'not_authorized' })
+    ask = settleRowAsk(ask, { kind: 'no_reply', at: '2026-09-28T23:10:00Z', detail: 'HTTP 502' })
+    render(<ExchangeStreamRow {...toggleProps()} askOutcome={ask} rail={NO_RAIL} row={makeRow('open_not_held')} />)
+    expect(screen.getByText('Declined')).toBeInTheDocument()
+    expect(document.querySelector('[data-ask-retry="true"]')).toHaveTextContent(/Asked again .*: no verified reply \(HTTP 502\)\.$/)
+  })
+
+  it('a record ask they declined: "They declined" on the face, and the (i) says the signed refusal once, with its time and reason', () => {
+    const ask = settleRowAsk(null, { kind: 'refused', at: '2026-09-28T23:00:00Z', reason: 'not_authorized' })
+    render(<ExchangeStreamRow {...toggleProps()} askOutcome={ask} rail={NO_RAIL} row={makeRow('open_not_held')} />)
+    expect(document.querySelector('[data-row-verdict-text]')).toHaveTextContent('They declined')
+    expect(document.querySelector('[data-verdict-detail]')?.textContent).toBe(
+      `Signed refusal, ${formatExchangeTimestamp('2026-09-28T23:00:00Z')}: their sharing settings don’t let them send it to this node. Their reply is verified: signed with the key this node has for them, for this request.`
+    )
+  })
+
+  it('an ask to a node that left the mesh says so in plain words, never the tool’s error', () => {
+    const ask = settleRowAsk(null, {
+      kind: 'no_reply',
+      at: '2026-09-28T23:10:00Z',
+      detail: 'That node isn’t on the mesh now, so it can’t be asked.',
+      plain: true
+    })
+    render(<ExchangeStreamRow {...toggleProps()} askOutcome={ask} rail={NO_RAIL} row={makeRow('open_not_held')} />)
+    // On the face, in place of "Waiting for their record".
+    expect(document.querySelector('[data-row-verdict-text]')).toHaveTextContent(
+      'That node isn’t on the mesh now, so it can’t be asked.'
+    )
+    expect(screen.queryByText('Waiting for their record')).not.toBeInTheDocument()
+    // The (i) keeps the dated detail, without repeating the face.
+    const detail = document.querySelector('[data-verdict-detail]')?.textContent ?? ''
+    expect(detail).toMatch(/^Asked .*\. No verified reply yet\./)
+    expect(detail).not.toContain('isn’t on the mesh')
+    expect(detail).not.toMatch(/could not reach|routable|\{/)
+  })
+
+  it('an ask that failed for another reason still waits on the face', () => {
+    const ask = settleRowAsk(null, {
+      kind: 'no_reply',
+      at: '2026-09-28T23:10:00Z',
+      detail: 'The ask didn’t go through, so there is no reply to check yet.',
+      plain: true
+    })
+    render(<ExchangeStreamRow {...toggleProps()} askOutcome={ask} rail={NO_RAIL} row={makeRow('open_not_held')} />)
+    expect(document.querySelector('[data-row-verdict-text]')).toHaveTextContent('Waiting for their record')
+    expect(document.querySelector('[data-verdict-detail]')).toHaveTextContent('The ask didn’t go through')
+  })
+})
+
+describe('ExchangeStreamRow — a row the pane shows with no other side, whose ask brings a contradicting record', () => {
+  it('reads Disagree, and Compare shows the difference from the asked record', async () => {
+    const user = userEvent.setup()
+    const theirs = fixtureHalfBody({ capsuleId: 'theirs-1', responseDigest: 'e'.repeat(64) })
+    const askOutcome = settleRowAsk(null, {
+      kind: 'record',
+      at: '2026-09-28T23:00:00Z',
+      evidence: { status: 'found', idMatch: true, signatureOk: true, peerRecord: theirs, fetch: vi.fn() }
+    })
+    const row = makeRow('open_not_asked')
+    expect(row.raw.theirs.state).toBe('absent')
+    const onToggleChecks = vi.fn()
+    const { rerender } = render(
+      <ExchangeStreamRow {...toggleProps()} askOutcome={askOutcome} onToggleChecks={onToggleChecks} rail={NO_RAIL} row={row} />
+    )
+    expect(screen.getByText('Disagree')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Compare' }))
+    expect(onToggleChecks).toHaveBeenCalledWith(row)
+    rerender(<ExchangeStreamRow {...toggleProps()} askOutcome={askOutcome} checksExpanded rail={NO_RAIL} row={row} />)
+    // The panel holds their record although the pane recorded no other side.
+    expect(screen.getAllByText('differs').length).toBeGreaterThan(0)
+    expect(document.querySelector(`[data-digest="${'e'.repeat(64)}"]`)).not.toBeNull()
+  })
+})
+
+describe('ExchangeStreamRow — the checks panel names the record whose checks it shows', () => {
+  it('the pane confirms record A, an ask returns contradicting record B: the panel shows B’s id with B’s checks', () => {
+    const idA = '9'.repeat(64)
+    const idB = 'f'.repeat(64)
+    const recordB = fixtureHalfBody({ capsuleId: idB, responseDigest: 'e'.repeat(64) })
+    const askOutcome = settleRowAsk(null, {
+      kind: 'record',
+      at: '2026-09-28T23:00:00Z',
+      evidence: { status: 'found', idMatch: true, signatureOk: true, peerRecord: recordB, fetch: vi.fn() }
+    })
+    // The pane names A, and the live fetch holds A, confirming.
+    const base = makeRow('closed')
+    const row = { ...base, raw: { ...base.raw, theirs: { ...base.raw.theirs, capsule_id: idA } } }
+    vi.mocked(usePeerLedgerRecompute).mockReturnValue({
+      status: 'found',
+      idMatch: true,
+      signatureOk: true,
+      peerRecord: fixtureHalfBody({ capsuleId: idA }),
+      fetch: vi.fn()
+    })
+    render(<ExchangeStreamRow {...toggleProps()} askOutcome={askOutcome} checksExpanded rail={NO_RAIL} row={row} />)
+    expect(screen.getByText('Disagree')).toBeInTheDocument()
+    const panel = screen.getByLabelText(`Security checks for ${row.exchangeKey}`)
+    expect(within(panel).getAllByText(idB).length).toBeGreaterThan(0)
+    expect(within(panel).queryByText(idA)).not.toBeInTheDocument()
+    expect(within(panel).getAllByText('differs').length).toBeGreaterThan(0)
+  })
+})

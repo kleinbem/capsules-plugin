@@ -1,0 +1,375 @@
+{
+  "config_schema": {
+    "plugin_name": "capsules",
+    "schema_version": 1,
+    "allow_unvalidated_config": false,
+    "settings": [
+      {
+        "key": "share_history_segments",
+        "value_schema": {
+          "kind": "enum",
+          "enum_values": [
+            "counterparties",
+            "prospective",
+            "peers",
+            "off"
+          ],
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "default_json": "\"counterparties\"",
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "Who may read your records and correlations: past counterparties (the default), any peer, or nobody. prospective is deprecated and read as counterparties. A refusal says nothing about the peer asking.",
+        "presentation": {
+          "label": "History segments",
+          "category_id": "show",
+          "category_label": "What you show others",
+          "category_summary": "What this node answers when a peer asks about you. Peers can only admit you on what you let them see.",
+          "category_order": 0,
+          "setting_order": 0
+        }
+      },
+      {
+        "key": "share_standard_history",
+        "value_schema": {
+          "kind": "enum",
+          "enum_values": [
+            "off",
+            "on"
+          ],
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "default_json": "\"off\"",
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "Answer a node you've never dealt with when it asks what you serve. No records are included. Checkpoints and the history card go to anyone who asks, whatever this is set to.",
+        "presentation": {
+          "label": "Service history to strangers",
+          "category_id": "show",
+          "category_label": "What you show others",
+          "category_summary": "What this node answers when a peer asks about you. Peers can only admit you on what you let them see.",
+          "category_order": 0,
+          "setting_order": 1
+        }
+      },
+      {
+        "key": "share_exchange_corroboration",
+        "value_schema": {
+          "kind": "enum",
+          "enum_values": [
+            "on",
+            "off"
+          ],
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "default_json": "\"on\"",
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "Tell a stranger whether you hold your half of one exchange, by its nonce. Ids and digests only, never who was on the other side.",
+        "presentation": {
+          "label": "Exchange corroboration",
+          "category_id": "show",
+          "category_label": "What you show others",
+          "category_summary": "What this node answers when a peer asks about you. Peers can only admit you on what you let them see.",
+          "category_order": 0,
+          "setting_order": 2
+        }
+      },
+      {
+        "key": "advertise_evidence_requests",
+        "value_schema": {
+          "kind": "enum",
+          "enum_values": [
+            "off",
+            "on"
+          ],
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "default_json": "\"off\"",
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "Publish your signed commitment to public Nostr relays so others can find this node's record. It carries your latest checkpoint and history card, which show your log's size. Asks sent there are not read yet. Off publishes nothing.",
+        "presentation": {
+          "label": "Advertise evidence requests",
+          "category_id": "show",
+          "category_label": "What you show others",
+          "category_summary": "What this node answers when a peer asks about you. Peers can only admit you on what you let them see.",
+          "category_order": 0,
+          "setting_order": 3
+        }
+      },
+      {
+        "key": "adjudicate_differing_twins",
+        "value_schema": {
+          "kind": "enum",
+          "enum_values": [
+            "off",
+            "on"
+          ],
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "default_json": "\"off\"",
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "Send the prompt and both answers to a third node to re-answer. Once per pair, never retried. Only you turn this on.",
+        "presentation": {
+          "label": "Ask a referee",
+          "category_id": "differ",
+          "category_label": "When answers differ",
+          "category_summary": "A client can send one request to two machines. These settings decide what happens when the two answers don't match.",
+          "category_order": 1,
+          "setting_order": 4
+        }
+      },
+      {
+        "key": "stop_routing_after_contradictions",
+        "value_schema": {
+          "kind": "integer",
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "Stop routing to a peer after this many contradictions (0 or empty: never, the default). Only verdicts you asked for and signature-checked count, once per referee and pair. With N of 2 or more, no single referee can trigger it. Needs `allow_peer_blocks = true` for this plugin in mesh-llm's config.",
+        "presentation": {
+          "label": "Stop routing after N contradictions",
+          "category_id": "differ",
+          "category_label": "When answers differ",
+          "category_summary": "A client can send one request to two machines. These settings decide what happens when the two answers don't match.",
+          "category_order": 1,
+          "setting_order": 5
+        }
+      },
+      {
+        "key": "stop_routing_window_days",
+        "value_schema": {
+          "kind": "integer",
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "default_json": "30",
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "The window, in days, the contradictions must fall in (default 30).",
+        "presentation": {
+          "label": "In D days",
+          "category_id": "differ",
+          "category_label": "When answers differ",
+          "category_summary": "A client can send one request to two machines. These settings decide what happens when the two answers don't match.",
+          "category_order": 1,
+          "setting_order": 6
+        }
+      },
+      {
+        "key": "referee_bar_days",
+        "value_schema": {
+          "kind": "integer",
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "default_json": "30",
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "After a referee-signed contradiction for a model, don't ask that node to referee that model for this many days (default 30).",
+        "presentation": {
+          "label": "Bar a contradicted referee for",
+          "category_id": "differ",
+          "category_label": "When answers differ",
+          "category_summary": "A client can send one request to two machines. These settings decide what happens when the two answers don't match.",
+          "category_order": 1,
+          "setting_order": 7
+        }
+      },
+      {
+        "key": "split_margin_threshold",
+        "value_schema": {
+          "kind": "float",
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "default_json": "4.41",
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "Referee margin (4.41). When two nodes give different answers to the same request, a third node re-answers it and checks how sure the model was at the word where they split. It only names a node as wrong if it was sure by at least this margin. Honest machines with different hardware differ by up to about 2.2, so 4.41 leaves a safety gap. Below the margin the result is \"inconclusive\" and counts against no one. Lowering it lets small demo models reach a verdict, but honest nodes can then be accused. Every verdict records the margin and the threshold it was judged by; the Evidence page says when the margin is below 4.41.",
+        "presentation": {
+          "label": "Referee's least margin to name a twin",
+          "category_id": "differ",
+          "category_label": "When answers differ",
+          "category_summary": "A client can send one request to two machines. These settings decide what happens when the two answers don't match.",
+          "category_order": 1,
+          "setting_order": 8
+        }
+      },
+      {
+        "key": "share_adjudications",
+        "value_schema": {
+          "kind": "enum",
+          "enum_values": [
+            "deliver_to_subjects",
+            "off"
+          ],
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "default_json": "\"deliver_to_subjects\"",
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "They ack or dispute on their own side. Delivery only, never a standing. A verdict already delivered cannot be recalled by turning this off.",
+        "presentation": {
+          "label": "Deliver verdicts to the nodes judged",
+          "category_id": "differ",
+          "category_label": "When answers differ",
+          "category_summary": "A client can send one request to two machines. These settings decide what happens when the two answers don't match.",
+          "category_order": 1,
+          "setting_order": 9
+        }
+      },
+      {
+        "key": "share_record_at_completion",
+        "value_schema": {
+          "kind": "enum",
+          "enum_values": [
+            "counterparty",
+            "off"
+          ],
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "default_json": "\"counterparty\"",
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "Push your sealed record of each exchange to the counterparty. Symmetric: off means you don't receive theirs either. It governs pushes only: a record you ask the other side for is checked and held either way. With checkpointing on, the push carries a checkpoint, which shows your log's size and time; the public checkpoint list shows when your exchanges ended.",
+        "presentation": {
+          "label": "Send your record to the other side",
+          "category_id": "records",
+          "category_label": "Keeping records",
+          "category_summary": "Who else holds a copy of what you sealed. This is what makes a later rewrite provable by someone other than you.",
+          "category_order": 2,
+          "setting_order": 10
+        }
+      },
+      {
+        "key": "witness",
+        "value_schema": {
+          "kind": "array",
+          "items": {
+            "kind": "object",
+            "object_properties": [
+              {
+                "key": "endpoint",
+                "value_schema": {
+                  "kind": "url",
+                  "allow_additional_properties": false
+                },
+                "required": true,
+                "description": "The witness service's URL."
+              },
+              {
+                "key": "public_key",
+                "value_schema": {
+                  "kind": "string",
+                  "allow_additional_properties": false
+                },
+                "required": false,
+                "description": "The witness's Ed25519 public key in hex, as its operator publishes it. Leave empty to have the plugin fetch it from the witness once and keep it; the Evidence page then says the key was pinned on first contact, not configured."
+              }
+            ],
+            "allow_additional_properties": false
+          },
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "Witness services to offer this node's checkpoints to: each one's URL, and its public key if you have it. Empty is off (the default): there is no default witness, and the plugin contacts none until you add one. The Evidence page shows what each witness holds. Takes effect when mesh-llm is restarted.",
+        "presentation": {
+          "label": "Witnesses",
+          "category_id": "records",
+          "category_label": "Keeping records",
+          "category_summary": "Who else holds a copy of what you sealed. This is what makes a later rewrite provable by someone other than you.",
+          "category_order": 2,
+          "setting_order": 11,
+          "placeholder": "https://witness.agentactioncapsule.org",
+          "renderer_id": "set-value"
+        }
+      },
+      {
+        "key": "join_network",
+        "value_schema": {
+          "kind": "enum",
+          "enum_values": [
+            "off",
+            "on"
+          ],
+          "allow_additional_properties": false
+        },
+        "required": false,
+        "default_json": "\"off\"",
+        "apply_mode": "static_on_load",
+        "restart_scope": "none",
+        "visibility": "user",
+        "description": "I add this node to the evidence network to help improve the evidence layer. The network may ask it for its history summary, usually daily, and never for the content of any request, answer or payment. A summary of its answers, or that it did not answer, is published at https://evidence-network.github.io/loop/stats/. To leave, turn this switch off: the asks stop on the next run, and past reports stay.",
+        "presentation": {
+          "label": "Join the evidence network",
+          "category_id": "network",
+          "category_label": "Evidence network",
+          "category_summary": "Whether this node is on the evidence network's list. Off by default.",
+          "category_order": 3,
+          "setting_order": 12
+        }
+      }
+    ]
+  },
+  "web_ui": {
+    "pages": [
+      {
+        "id": "evidence",
+        "label": "Evidence",
+        "route": "evidence",
+        "bundle_id": "main",
+        "entry_script": "register-mesh-plugin-ui.js",
+        "placement": "primary",
+        "host_header": false
+      }
+    ],
+    "contributions": [
+      {
+        "id": "evidence-chat",
+        "slot": "chat_message",
+        "label": "Evidence",
+        "bundle_id": "main",
+        "entry_script": "register-mesh-plugin-ui.js"
+      },
+      {
+        "id": "evidence-logs",
+        "slot": "logs_request",
+        "label": "Evidence",
+        "bundle_id": "main",
+        "entry_script": "register-mesh-plugin-ui.js"
+      }
+    ],
+    "bundles": [
+      {
+        "id": "main",
+        "root_path": "bundle"
+      }
+    ]
+  }
+}

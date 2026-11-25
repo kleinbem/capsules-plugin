@@ -1,0 +1,272 @@
+[package]
+name = "evidence-plugin"
+version = "0.1.19"
+edition = "2021"
+license = "Apache-2.0"
+description = "The capsules mesh-llm plugin: a signed, hash-chained record of every exchange and the Evidence page."
+publish = false
+
+[[bin]]
+name = "capsules"
+path = "src/main.rs"
+
+[features]
+# Test-only: the Service History period epoch and length are read from
+# CAPSULES_TEST_PERIOD_EPOCH and CAPSULES_TEST_PERIOD_LENGTH_S, so the
+# two-node e2e reaches a period boundary in minutes. The override is another
+# definition, with its own digests. The release build never enables it.
+test-period-policy = []
+# Deliberately-broken variant: never denies a blocked model (fail-open bug).
+# Built and run against the same interop test to prove the test actually
+# distinguishes correct behavior from this specific regression.
+mutant-blocked-model-served = []
+# Deliberately-broken variant: treats an unparseable body as allow instead of
+# deny (silently fail-open on malformed input instead of failing safe).
+mutant-malformed-body-served = []
+# Deliberately-broken receiver: skips the claim checks on a served half (who
+# served it, which weights). CI builds it and requires the record-push parity
+# run to FAIL, so the parity run is shown to catch a receiver that drops a
+# check, not only a changed answer file.
+mutant-record-push-skips-claims = []
+# Deliberately-broken responder: answers evidence requests without the
+# sharing-policy gate. CI builds it and requires the evidence-request parity
+# run to FAIL on the not_authorized cases.
+mutant-evidence-skips-policy-gate = []
+# Deliberately-broken requester: checks an answer's witness receipts with no
+# keys, as before 0.1.5. CI builds it and requires the witness-key tests to
+# FAIL on a receipt under its witness's configured key.
+mutant-answer-ignores-witness-keys = []
+# Deliberately-broken TEE check: accepts a quote whose REPORT_DATA does not
+# bind the record. CI builds it and requires the tee_attest tests to FAIL on
+# the quote-bound-to-another-record case.
+mutant-tee-skips-binding-check = []
+# Deliberately-broken announce: this node never asks the host to announce
+# its key. CI builds it and requires the own-key tests to FAIL, so a peer
+# with no configured keys is shown to depend on the announce.
+mutant-own-key-not-announced = []
+# Deliberately-broken responder: accepts any requester signature. CI builds
+# it and requires the requester-auth tests to FAIL on PRD T3, a node signing
+# under another node's key id.
+mutant-requester-auth-skips-verify = []
+# Deliberately-broken responder: accepts a signed request addressed to any
+# node. CI requires the relay test to FAIL.
+mutant-requester-auth-skips-audience = []
+# Deliberately-broken responder: answers every failed signature as an
+# unsigned request would be. CI requires the never-downgraded tests to FAIL.
+mutant-requester-auth-downgrades-all = []
+# Deliberately-broken signer and responder: every channel signs under the
+# Evidence Request's tag again. CI requires the cross-channel tests to FAIL.
+mutant-requester-auth-shared-tag = []
+
+# Deliberately-broken historical-reference corroboration
+# (exchange_corroboration/1): each builds one fault, and CI requires the
+# named exchange_corroboration test to FAIL (gates/mutants.json).
+# Resolves against the wide correlation index (exchange_id, request nonce,
+# digest binding) instead of the bound client nonce.
+mutant-corroboration-wide-index = []
+# Joins halves on their digest binding when X's half binds no client nonce.
+mutant-corroboration-joins-by-binding = []
+# Records a signed refusal as an absence.
+mutant-corroboration-refusal-as-absence = []
+# Gates the derivation on share_standard_history instead of its own setting.
+mutant-corroboration-uses-standard-history-gate = []
+# Drops the halves that do not name the asker instead of refusing whole.
+mutant-corroboration-filters-per-asker = []
+# Counts two halves with the same role as agreeing.
+mutant-corroboration-role-equality = []
+# Names no counterparty for a citing record (`received_half`), so an exchange
+# request is refused to the node that sent the half (#172).
+mutant-citing-record-names-no-counterparty = []
+# Matches the records that never leave this node in a keyed answer again
+# (correlation, exchange, exchange_corroboration/1), so a refusal or a moved
+# checkpoint says one sits under the key (#161).
+mutant-answer-matches-never-leaves = []
+# The Service History's mutants: each builds it with one fault, and CI
+# requires the named test to FAIL (gates/mutants.json).
+# Embeds a card rebuilt without its consistency proofs, not the direct card.
+mutant-service-history-card-rebuilt = []
+
+# The referee's implementation mutants: each builds the referee with one
+# deliberate fault (vectors/parity/referee/mutants.json names the fault and
+# the cases that must catch it). CI builds each and requires the referee
+# parity run to FAIL on those cases.
+mutant-referee-select-skips-bar-window = []
+mutant-referee-select-mixes-tiers = []
+mutant-referee-select-ignores-blocked = []
+mutant-referee-verdict-tier-not-sealed = []
+mutant-referee-hold-ignores-the-asked-tier = []
+mutant-referee-request-asks-twice-per-pair = []
+mutant-referee-counts-skip-asked-gate = []
+mutant-referee-verdict-names-wrong-twin = []
+mutant-referee-hold-skips-asked-check = []
+mutant-referee-ignores-split-margin = []
+
+[dependencies]
+mesh-llm-plugin = "0.78"
+tokio = { version = "1", features = ["full"] }
+# The ledger's re-entrant append turn (`capsule_emit::CapsuleState`): std's
+# `ReentrantLock` is not stable. Already in the tree through tokio and others.
+parking_lot = "0.12"
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+anyhow = "1"
+thiserror = "1"
+sha2 = "0.10"
+hex = "0.4"
+ed25519-dalek = "2"
+# The TDX quote's signature chain (`producer::tee_attest`, checks 5-8):
+# ECDSA P-256 over the quote and the QE report, and the PCK certificates.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+x509-cert = { version = "0.2", default-features = false, features = ["pem", "std"] }
+# The interop profile's MMR proofs in a received evidence answer
+# (`evidence_artifact`): deterministic CBOR. Already in the tree through
+# evidence-request.
+ciborium = "0.2"
+# The `ledger-fetch/1` responder (`ledger_fetch_bridge`) base64-encodes raw
+# COSE_Sign1 bytes for its JSON carrier.
+base64 = "0.22"
+tracing = "0.1"
+# mesh keeps the console's plugin settings in its config file and does not
+# pass them to the plugin; the plugin reads them there (`settings`).
+toml = "0.9"
+# Record times and the stop-routing rule's window (`routing_rule`).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The referee's re-answer goes through the host's own OpenAI-compatible API
+# (`referee::live`, only when the operator turned the referee on); the interop
+# tests also drive the plugin's routes with it.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# The capsule producer: every record this plugin seals, its ledger,
+# checkpoints and offline verification come from the capsule-emit crate; the
+# mesh record kinds are written against its extension points in `producer`.
+# A pushed record's checks, `capsule_id` and producer signature are checked
+# with it too, and a bundle's inclusion proof with `cll`. Renamed because
+# this crate already has a `capsule_emit` module.
+# 0.0.4 carries `settlement` (draft-mih-agent-settlement-records-00 legs);
+# 0.0.6 gives each witness its own client, dialled at the URL given (no
+# built-in service, no redirect followed); 0.0.8 sits on cll 0.3.1 directly,
+# with no evidencebook; 0.0.9 adds `produce` (the Go-identical Capsule
+# build, which the deal records are sealed with) and leaves Class 1 checks to
+# agent-action-capsule (`structure` is gone). Its canonicalizer turns on serde_json's
+# `arbitrary_precision` for the whole binary (see `strict_json`). 0.0.13 is on
+# checkpointed-local-log 0.6.0 and agent-action-capsule 0.11.0, the one CLL line
+# the shelf needs (evidencebook#254 §7.4), with capsule-emit-artifact 0.0.4.
+capsule-emit-lib = { package = "capsule-emit", version = "0.0.13" }
+cll = { package = "checkpointed-local-log", version = "0.6.0", features = ["sqlite"] }
+# The chain's records: capsule-emit's artifact store (SQLite backend), the
+# layer its `Ledger` keeps each line in beside the CLL log, both on the node's
+# shelf, `ledger/shelf.db` (`chain_store`). The version capsule-emit 0.0.13
+# and the shelf both use, so they pass records through one crate.
+capsule-emit-artifact = { version = "0.0.4", features = ["sqlite"] }
+# The shelf's host table beside CLL's and the artifact store's tables (the
+# chain's checkpoint history, `chain_store::ChainLog`) and the readers'
+# connections: the rusqlite both of those build, with its bundled SQLite.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Evidence requests are answered in-process (`evidence_answer`): parsing,
+# resolution and signed refusals come from the protocol crate
+# (draft-mih-agent-evidence-request-00), `evidence-request`, which is what
+# `capsule-emit-evidence-request` became when it moved to
+# agent-action-capsule; so do the interop profile's signed envelope and its
+# check of Checkpointed Local Log material (`cll`) and witness receipts
+# (`receipt`). The artifact is built by evidencebook (below).
+# Pinned exactly: a new release may change what verifies.
+evidence-request = { version = "=0.7.0", features = ["cll", "receipt", "acceptance"] }
+# The "asked of you" log (`evidence_answer::log_received`) is evidencebook's
+# `received` (evidencebook#35), and a ledger line is read into its
+# `served_summary` facts (`evidence_log::leaf_facts`), whose model Service
+# History counts; which directory the log may write is this plugin's. This
+# node no longer answers `served_summary/1` (#106). Every answer is built by its
+# `answer::build` over this plugin's index (`evidence_log`, a store of the
+# crate's); 0.0.10 carries a derivation of this node's own named by its
+# digest (exchange corroboration). Receipts are checked with
+# agent-action-capsule 0.5's witness verifier. Same checkpointed-local-log
+# and evidence-request lines as above.
+# The node's shelf (`shelf`, evidencebook#254 §7): the chain is one host log
+# on it. 0.0.12 is the first release with it, on checkpointed-local-log 0.4.0.
+# Pinned exactly: the shelf's file is a cross-language contract.
+evidencebook = { version = "=0.0.21", features = ["deal", "shelf"] }
+# Admission's price rule (#105) is decided by capsule-engine's guard with its
+# asg/inference terms pack (capsule-engine#265, `rust/capsule-engine`), the
+# evaluator Muse's Go guard shares vectors with, so the plugin runs no second
+# one. Its admission evaluator (`capsule_engine::admission`, capsule-engine#265
+# and #268) decides the base pack (#178). Not on crates.io: pinned by the
+# merge commit.
+capsule-engine = { git = "https://github.com/action-state-group/capsule-engine", rev = "c7701385b87b68c631803e5d0adeee4d617ff5d4" }
+# Class 1 verification of a received half (capsule-emit main moved it here),
+# and, with `inference-history`, the Service History's derivation and checks
+# (`service_history`, evidencebook#322). capsule-emit 0.0.13 builds on 0.11.0 too, so
+# one line of this crate is in the tree.
+agent-action-capsule = { version = "0.12.0", features = ["strict", "inference-history"] }
+# The witness's own record of this log (`witness_status`): one blocking GET,
+# no redirects, a capped body. Already in the tree through capsule-emit.
+ureq = { version = "2", features = ["json"] }
+# O_NOFOLLOW for the lock files (`data_dir`). Already in the tree.
+libc = "0.2"
+# A witness's receipt for a checkpoint is checked offline before the page
+# counts it (`witness_status`). 0.1.0 is yanked, so this resolves to 0.1.1 or
+# later.
+scitt-cose-receipt = "0.1"
+# A controller binding to an operator's Nostr key (`controller_binding`): the
+# `bip340` key type signs a Nostr event with BIP-340 Schnorr over secp256k1
+# (AAC Controller Binding §4.1). Same RustCrypto line as p256.
+k256 = { version = "0.13", default-features = false, features = ["schnorr", "std"] }
+# A controller binding's nonce (CB §9.3) and a service evidence agreement's
+# session id (`agreement`): 128 random bits each. Already in the tree.
+getrandom = "0.2"
+# The announce event goes to each Nostr relay over a WebSocket
+# (`nostr_announce`): blocking tungstenite on a rustls stream with the ring
+# provider the rest of the tree already builds, and the webpki roots.
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+# Shortest-round-trip float digits for `python_repr_f64`, the same source the
+# mesh-llm host and Python's repr agree on (Rust Display ties differ).
+ryu = "1"
+
+[dev-dependencies]
+# The record-push parity run reads its own golden answers, which hold a record
+# nested at the strict parser's limit inside the answer's own nesting. Only
+# the test's fixture reader lifts the limit (`disable_recursion_limit`); a
+# pushed body is still parsed under the default one.
+serde_json = { version = "1", features = ["unbounded_depth"] }
+# Temporary ledger directories in the Evidence route and pane tests.
+tempfile = "3"
+# Decodes the `CallToolResult` a `tools/call` `RpcResponse` carries, in
+# `tests/mesh_evidence_bridge_interop.rs` -- same version mesh-llm-plugin
+# itself pins, so the wire shape matches exactly.
+rmcp = "3"
+# Frames the fake host's envelopes in `tests/quiet_default_interop.rs`, whose
+# reader task owns the read half of the plugin socket -- same version
+# mesh-llm-plugin itself pins.
+prost = "0.14"
+# Mints witness receipts (COSE_Sign1, EdDSA, RFC 9162 inclusion proof) for the
+# answer-verification tests -- the same coset the evidence-request crate reads.
+coset = "0.4"
+# Builds a test-only TDX certificate chain for the quote signature checks.
+x509-cert = { version = "0.2", features = ["builder"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+sha2 = { version = "0.10", features = ["oid"] }
+
+[profile.release]
+# Ship the release binary without its symbol table: about a quarter smaller
+# (Linux x86_64: 15.8 MB -> 11.6 MB measured), nothing else changes. A panic
+# still prints its message and location; a backtrace shows addresses instead
+# of function names.
+strip = true
+
+# Debug builds hash with an optimised SHA-256. The plugin reads and hashes its
+# own executable once per process (its runtime measurement), and an
+# unoptimised SHA-256 over a debug binary of about 190 MB takes about 19 s on
+# arm64, which every test that starts the plugin and seals a record would wait
+# for. Release builds and every output are unchanged.
+[profile.dev.package.sha2]
+opt-level = 3
+
+# `PluginContext::announce_plugin_key` (host capability `plugin_keys.v1`,
+# mesh-llm #2299) is on mesh-llm main but in no published mesh-llm-plugin yet:
+# 0.78.1 predates it. Taken from the commit the hosts run until a release
+# carries it; then this goes and the requirement above moves to that release.
+[patch.crates-io]
+mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm", rev = "a39211e78f3dd73cf9a94b08417c0da17e5fa5d9" }
