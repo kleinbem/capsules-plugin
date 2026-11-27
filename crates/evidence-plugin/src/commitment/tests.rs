@@ -1,0 +1,767 @@
+use super::*;
+use crate::evidence_request_parity::{corpus_ledger_dir, NODE_KEY_SEED};
+use crate::requester_auth::{Keys, ReplayCache};
+use std::collections::BTreeMap;
+
+const NOW: &str = "2026-10-28T00:00:00Z";
+pub(crate) const NODE: &str = "16a607c33006dd4243cb2347c4bdbaa5129a590b5257eea62ac5047abcf87864";
+
+fn key() -> SigningKey {
+    SigningKey::from_bytes(&NODE_KEY_SEED)
+}
+
+pub(crate) fn defaults() -> Policy {
+    Policy::from_settings(|_| None)
+}
+
+/// A commitment over the parity corpus, signed by its node, under `policy`.
+pub(crate) fn built(policy: &Policy) -> Signed {
+    let dir = tempfile::tempdir().unwrap();
+    corpus_ledger_dir(dir.path(), &key());
+    built_over(dir.path(), policy)
+}
+
+/// A commitment over the ledger in `dir`, signed by the node, under `policy`.
+fn built_over(dir: &std::path::Path, policy: &Policy) -> Signed {
+    let key = key();
+    let digest = policy.digest(&key);
+    let announced = BTreeMap::new();
+    let replay = ReplayCache::default();
+    let responder = Responder {
+        ledger_dir: dir,
+        signing_key: &key,
+        now: NOW,
+        history_segments: policy.history_segments,
+        share_standard_history: policy.share_standard_history,
+        share_exchange_corroboration: policy.share_exchange_corroboration,
+        keys: Keys {
+            announced: &announced,
+            configured: None,
+            own_key: None,
+        },
+        replay: &replay,
+        node_id: Some(NODE),
+        policy_digest: Some(&digest),
+    };
+    build(&responder, NODE, policy, None, None).unwrap()
+}
+
+/// `signed` with `edit` applied to its commitment, signed again.
+fn resigned(signed: &Signed, edit: impl FnOnce(&mut Value)) -> Signed {
+    let mut doc = signed.commitment.clone();
+    edit(&mut doc);
+    Signed {
+        commitment: sign(doc, &key()),
+        policy: signed.policy.clone(),
+    }
+}
+
+/// `signed` with `edit` applied to its stapled card, carried and signed
+/// again: only the staple's own checks can refuse it.
+fn restapled(signed: &Signed, edit: impl FnOnce(&mut Value)) -> Signed {
+    resigned(signed, |d| {
+        let mut card: Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(d["history_cards"][0]["bytes"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        edit(&mut card);
+        let raw = serde_json::to_vec(&card).unwrap();
+        d["history_cards"][0]["bytes"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(&raw));
+        d["history_cards"][0]["sha256"] = json!(hex::encode(Sha256::digest(&raw)));
+    })
+}
+
+#[test]
+fn the_default_settings_give_exactly_the_pinned_policy_file() {
+    let pinned: Value = serde_json::from_str(DEFAULT_POLICY).unwrap();
+    assert_eq!(defaults().body(), pinned);
+    // The file is the body as the plugin would print it, so it can be read
+    // as the documentation of the default.
+    assert_eq!(
+        DEFAULT_POLICY,
+        format!("{}\n", serde_json::to_string_pretty(&pinned).unwrap())
+    );
+}
+
+#[test]
+fn every_switch_changes_the_policy_and_its_digest() {
+    let key = key();
+    let default_digest = defaults().digest(&key);
+    for (env, value) in [
+        (share_policy::ENV_RECORD_AT_COMPLETION, "off"),
+        (share_policy::ENV_HISTORY_SEGMENTS, "peers"),
+        (share_policy::ENV_HISTORY_SEGMENTS, "off"),
+        (share_policy::ENV_STANDARD_HISTORY, "on"),
+        (share_policy::ENV_EXCHANGE_CORROBORATION, "off"),
+        (share_policy::ENV_ADVERTISE_EVIDENCE_REQUESTS, "on"),
+        (share_policy::ENV_ADJUDICATIONS, "off"),
+    ] {
+        let policy = Policy::from_settings(|e| (e == env).then(|| value.to_string()));
+        assert_ne!(policy, defaults(), "{env}={value}");
+        assert_ne!(policy.digest(&key), default_digest, "{env}={value}");
+    }
+}
+
+#[test]
+fn a_value_the_plugin_does_not_know_is_stated_as_it_is_read() {
+    // An unknown `share_history_segments` is read as off, and the policy
+    // says off, never the value the operator typed.
+    let policy = Policy::from_settings(|e| {
+        (e == share_policy::ENV_HISTORY_SEGMENTS).then(|| "everyone".to_string())
+    });
+    assert_eq!(policy.body()["share_history_segments"], "off");
+}
+
+#[test]
+fn the_digest_is_of_the_signed_policy_file_and_does_not_change_between_signings() {
+    let key = key();
+    let policy = defaults();
+    let bytes = policy.signed_bytes(&key);
+    assert_eq!(bytes, policy.signed_bytes(&key));
+    assert_eq!(policy.digest(&key), hex::encode(Sha256::digest(&bytes)));
+    let doc: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(doc["profile"], POLICY_PROFILE);
+    assert_eq!(doc["key_id"], key_id(&key));
+    assert_eq!(doc["policy"], policy.body());
+    assert!(signature_verifies(&doc, &key.verifying_key()));
+}
+
+#[test]
+fn the_answers_lists_are_pinned_and_follow_the_settings() {
+    assert_eq!(
+        *DERIVATIONS,
+        [
+            "checkpoints",
+            "history_card/1",
+            "history_card/2",
+            crate::exchange_corroboration::DEFINITION_DIGEST,
+            crate::service_history::DEFINITION_DIGEST,
+            crate::service_history::DEFINITION_DIGEST_2,
+            crate::verdict_held::DEFINITION_DIGEST,
+        ]
+    );
+    assert_eq!(
+        defaults().subjects(),
+        [
+            "checkpoints",
+            "full_history",
+            "record",
+            "exchange",
+            "correlation"
+        ]
+    );
+    let off = Policy::from_settings(|e| {
+        (e == share_policy::ENV_HISTORY_SEGMENTS).then(|| "off".to_string())
+    });
+    assert_eq!(off.subjects(), ["checkpoints", "full_history"]);
+    let signed = built(&off);
+    assert_eq!(
+        signed.commitment["answers"]["subjects"],
+        json!(["checkpoints", "full_history"])
+    );
+    assert_eq!(
+        signed.commitment["answers"]["derivations"],
+        json!(*DERIVATIONS)
+    );
+}
+
+#[test]
+fn a_built_commitment_has_exactly_the_members_and_verifies() {
+    let signed = built(&defaults());
+    let doc = &signed.commitment;
+    assert_eq!(verify(&signed), Vec::<String>::new());
+    let mut members: Vec<&str> = doc
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    members.sort_unstable();
+    let mut schema: Vec<&str> = super::schema(&doc["profile"])
+        .iter()
+        .map(|(n, _)| *n)
+        .collect();
+    schema.sort_unstable();
+    assert_eq!(members, schema);
+    assert_eq!(doc["profile"], "evidence-commitment/1");
+    assert_eq!(doc["node_id"], NODE);
+    assert_eq!(doc["key_id"], key_id(&key()));
+    assert_eq!(doc["issued_at"], NOW);
+    assert_eq!(doc["ask"]["endpoint"], format!("mesh:{NODE}"));
+    assert_eq!(doc["lcap"]["policy_uri"], format!("policies/{NODE}.json"));
+    assert_eq!(doc["lcap"]["policy_digest"], defaults().digest(&key()));
+    assert_eq!(doc["human_gated"], false);
+    assert_eq!(doc["answers_within"], ANSWERS_WITHIN);
+}
+
+/// The controller binding is named by its digest alone, only when given,
+/// and any other shape of the member is refused (loop's `OPTIONAL`).
+#[test]
+fn a_controller_binding_is_named_by_its_digest_alone() {
+    let digest = "ab".repeat(32);
+    let signed = resigned(&built(&defaults()), |d| {
+        d[CONTROLLER_BINDING] = json!({ "digest": digest })
+    });
+    assert_eq!(verify(&signed), Vec::<String>::new());
+    assert!(built(&defaults())
+        .commitment
+        .get(CONTROLLER_BINDING)
+        .is_none());
+    for (value, says) in [
+        (
+            json!({"digest": "AB".repeat(32)}),
+            "controller_binding.digest is not a sha256",
+        ),
+        (json!({}), "missing controller_binding.digest"),
+        (
+            json!({"digest": digest, "keys": [digest]}),
+            "unknown field controller_binding.keys",
+        ),
+        (json!(digest), "controller_binding has the wrong type"),
+    ] {
+        let bad = resigned(&built(&defaults()), |d| {
+            d[CONTROLLER_BINDING] = value.clone()
+        });
+        let problems = verify(&bad);
+        assert!(
+            problems.iter().any(|p| p.contains(says)),
+            "{says}: {problems:?}"
+        );
+    }
+}
+
+#[test]
+fn the_checkpoint_is_the_latest_and_the_staple_is_what_a_stranger_gets() {
+    let dir = tempfile::tempdir().unwrap();
+    let cps = corpus_ledger_dir(dir.path(), &key());
+    let signed = built(&defaults());
+    let raw = |member: &str| {
+        let entry = match member {
+            "history_card" => &signed.commitment["history_cards"][0],
+            m => &signed.commitment[m],
+        };
+        base64::engine::general_purpose::STANDARD
+            .decode(entry["bytes"].as_str().unwrap())
+            .unwrap()
+    };
+    // A checkpoint's anchor digest is the SHA-256 of its statement.
+    let latest = cps.last().unwrap().anchor();
+    assert_eq!(hex::encode(Sha256::digest(raw("checkpoint"))), latest);
+    let staple: Value = serde_json::from_slice(&raw("history_card")).unwrap();
+    assert_eq!(staple["profile"], STAPLE_PROFILE);
+    assert_eq!(staple["derivation"], "history_card/2");
+    assert_eq!(staple["responder"], key_id(&key()));
+    assert_eq!(staple["anchor"]["digest"], latest);
+}
+
+/// The staple is L0 (`history_card/2`) on every setting (Steven, 2026-11-01:
+/// a node staples L0 in its commitment; plugin#241). No switch widens it:
+/// with standard history and advertising both on, the stapled card is
+/// byte for byte the one the default settings give, and so carries no
+/// Service History.
+#[test]
+fn no_setting_changes_the_staple() {
+    let on = Policy::from_settings(|env| {
+        [
+            share_policy::ENV_STANDARD_HISTORY,
+            share_policy::ENV_ADVERTISE_EVIDENCE_REQUESTS,
+        ]
+        .contains(&env)
+        .then(|| "on".to_string())
+    });
+    assert!(on.share_standard_history && on.advertise_evidence_requests);
+    let (plain, wide) = (built(&defaults()), built(&on));
+    assert_ne!(
+        plain.commitment["lcap"]["policy_digest"], wide.commitment["lcap"]["policy_digest"],
+        "the settings are in the signed policy"
+    );
+    assert_eq!(
+        plain.commitment["history_cards"],
+        wide.commitment["history_cards"]
+    );
+    assert_eq!(
+        plain.commitment["history_cards"][0]["derivation"],
+        "history_card/2"
+    );
+    for signed in [&plain, &wide] {
+        // verify() enforces the exact SCHEMA member set, so a wider policy
+        // adds no member above L0.
+        assert_eq!(verify(signed), Vec::<String>::new());
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(
+                signed.commitment["history_cards"][0]["bytes"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let text = String::from_utf8(raw).unwrap();
+        assert!(!text.contains("service_history") && !text.contains("standard_history"));
+    }
+}
+
+#[test]
+fn no_checkpoint_means_no_commitment() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = key();
+    let announced = BTreeMap::new();
+    let replay = ReplayCache::default();
+    let policy = defaults();
+    let responder = Responder {
+        ledger_dir: dir.path(),
+        signing_key: &key,
+        now: NOW,
+        history_segments: policy.history_segments,
+        share_standard_history: false,
+        share_exchange_corroboration: false,
+        keys: Keys {
+            announced: &announced,
+            configured: None,
+            own_key: None,
+        },
+        replay: &replay,
+        node_id: Some(NODE),
+        policy_digest: None,
+    };
+    let err = build(&responder, NODE, &policy, None, None).unwrap_err();
+    assert!(err.why.contains("no checkpoint"), "{err:?}");
+    assert!(!err.lasting);
+}
+
+#[test]
+fn the_wire_form_round_trips_the_policy_bytes_exactly() {
+    let signed = built(&defaults());
+    assert_eq!(Signed::from_wire(&signed.to_wire()).unwrap(), signed);
+}
+
+#[test]
+fn each_tampering_is_refused() {
+    let signed = built(&defaults());
+    let cases: Vec<(&str, Signed)> = vec![
+        ("a member changed after signing", {
+            let mut s = signed.clone();
+            s.commitment["human_gated"] = json!(true);
+            s
+        }),
+        (
+            "an unknown member",
+            resigned(&signed, |d| d["extra"] = json!("x")),
+        ),
+        (
+            "a missing member",
+            resigned(&signed, |d| {
+                d.as_object_mut().unwrap().remove("answers_within");
+            }),
+        ),
+        (
+            "a count",
+            resigned(&signed, |d| d["ask"]["bindings"] = json!(["12"])),
+        ),
+        (
+            "a key named as a count",
+            resigned(&signed, |d| {
+                d["lcap"]["predicate_classes"] = json!({"answerCount": "x"})
+            }),
+        ),
+        (
+            "another node's policy",
+            Signed {
+                commitment: signed.commitment.clone(),
+                policy: Policy::from_settings(|e| {
+                    (e == share_policy::ENV_STANDARD_HISTORY).then(|| "on".to_string())
+                })
+                .signed_bytes(&key()),
+            },
+        ),
+        ("a policy signed by another key", {
+            let other = SigningKey::from_bytes(&[9; 32]);
+            let mut doc: Value = serde_json::from_slice(&signed.policy).unwrap();
+            doc = sign(doc, &other);
+            let policy = jcs(&doc).into_bytes();
+            resigned(
+                &Signed {
+                    commitment: signed.commitment.clone(),
+                    policy: policy.clone(),
+                },
+                |d| d["lcap"]["policy_digest"] = json!(hex::encode(Sha256::digest(&policy))),
+            )
+        }),
+        (
+            "checkpoint bytes not their digest",
+            resigned(&signed, |d| {
+                d["checkpoint"]["sha256"] = json!("0".repeat(63) + "a")
+            }),
+        ),
+        (
+            "a staple presented by another",
+            restapled(&signed, |card| card["responder"] = json!("ab".repeat(32))),
+        ),
+        (
+            "a staple with no artifact and no artifact_digest",
+            restapled(&signed, |card| {
+                let card = card.as_object_mut().unwrap();
+                card.remove("artifact");
+                card.remove("artifact_digest");
+            }),
+        ),
+        (
+            "a staple whose artifact is not base64url",
+            restapled(&signed, |card| card["artifact"] = json!("!!")),
+        ),
+        (
+            "a staple whose artifact_digest is not a string",
+            restapled(&signed, |card| card["artifact_digest"] = json!(null)),
+        ),
+        (
+            "a key_id that is not spki",
+            resigned(&signed, |d| d["key_id"] = json!("ab".repeat(32))),
+        ),
+        (
+            "a duration that is not one",
+            resigned(&signed, |d| d["answers_within"] = json!("PT")),
+        ),
+        (
+            "a predicate class with no source",
+            resigned(&signed, |d| {
+                d["lcap"]["predicate_classes"] = json!(["performed"])
+            }),
+        ),
+    ];
+    for (name, case) in cases {
+        assert!(!verify(&case).is_empty(), "{name} must be refused");
+    }
+}
+
+#[test]
+fn the_count_rule_splits_names_as_loop_does() {
+    assert_eq!(tokens("answerCount"), ["answer", "count"]);
+    assert_eq!(
+        tokens("history_card.size-n"),
+        ["history", "card", "size", "n"]
+    );
+    assert!(count_problems(&json!({"a": 3}), &mut Vec::new()).len() == 1);
+    assert!(count_problems(&json!({"a": "3a"}), &mut Vec::new()).is_empty());
+    // The opaque bytes are not scanned.
+    assert!(count_problems(&json!({"checkpoint": {"bytes": "123"}}), &mut Vec::new()).is_empty());
+}
+
+#[test]
+fn durations_and_classes_read_as_loop_reads_them() {
+    for ok in ["PT1M", "P1D", "PT24H", "P1DT2H", "PT1H30M5S"] {
+        assert!(is_duration(ok), "{ok}");
+    }
+    for bad in ["", "P", "PT", "P1DT", "1M", "PT1M1H", "PTM", "P1H"] {
+        assert!(!is_duration(bad), "{bad}");
+    }
+    assert!(is_predicate_class("performed:counterparty_half"));
+    assert!(is_predicate_class("recorded:self_attested"));
+    assert!(!is_predicate_class("Performed:x"));
+    assert!(!is_predicate_class("performed:"));
+}
+
+#[test]
+fn a_refusal_names_the_digest_of_the_policy_it_was_refused_under() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = key();
+    corpus_ledger_dir(dir.path(), &key);
+    let policy = defaults();
+    let digest = policy.digest(&key);
+    let announced = BTreeMap::new();
+    let replay = ReplayCache::default();
+    let responder = Responder {
+        ledger_dir: dir.path(),
+        signing_key: &key,
+        now: NOW,
+        history_segments: policy.history_segments,
+        share_standard_history: policy.share_standard_history,
+        share_exchange_corroboration: policy.share_exchange_corroboration,
+        keys: Keys {
+            announced: &announced,
+            configured: None,
+            own_key: None,
+        },
+        replay: &replay,
+        node_id: Some(NODE),
+        policy_digest: Some(&digest),
+    };
+    let service_history = json!({
+        "subject": {"full_history": null},
+        "coverage": {"min_freshness": 1},
+        "derivation": crate::service_history::definition_digest(),
+    });
+    let bytes = serde_json::to_vec(&service_history).unwrap();
+    for outcome in [
+        evidence_answer::answer(&bytes, &responder),
+        evidence_answer::decline_busy(&bytes, &responder),
+    ] {
+        let Outcome::Refused { wire, .. } = outcome else {
+            panic!("a stranger is refused service_history/1 by default");
+        };
+        assert_eq!(wire["policy_digest"], digest);
+        // The member is beside the signed ones: the refusal still checks.
+        let check = evidence_request::refusal::check(&wire);
+        assert!(check.conformant, "{wire}");
+    }
+    let signed = built(&policy);
+    assert_eq!(signed.commitment["lcap"]["policy_digest"], digest);
+}
+
+/// A commitment over a ledger with a checkpoint after every line, `long`
+/// lines of it.
+fn long_ledger_commitment(long: usize) -> Signed {
+    let dir = tempfile::tempdir().unwrap();
+    crate::evidence_request_parity::long_ledger_dir(dir.path(), &key(), long);
+    built_over(dir.path(), &defaults())
+}
+
+/// A node with a long ledger (loop lab-3's `history_card/1` staple made its
+/// commitment 1,135,361 bytes at 375 checkpoints): the `/2` staple is a
+/// sample, so the frame stays far below the 1 MiB an ordinary side-stream
+/// reply may be, and verifies as a peer verifies it.
+#[test]
+fn a_commitment_over_a_long_ledger_is_small_and_verifies() {
+    let signed = long_ledger_commitment(400);
+    let size = serde_json::to_vec(&signed.to_wire()).unwrap().len();
+    let ordinary = crate::mesh_evidence_bridge::MAX_SIDE_STREAM_BYTES as usize;
+    assert!(
+        size < ordinary / 4,
+        "{size} bytes is not far below {ordinary}"
+    );
+    assert!(fits(&signed).is_ok());
+    assert_eq!(verify(&signed), Vec::<String>::new());
+}
+
+/// Past `MAX_ANSWER_CHECKPOINTS` the `/1` card is refused whoever asks; the
+/// `/2` staple is not bounded by the count (capsules-plugin#76).
+#[test]
+fn a_commitment_past_the_checkpoint_cap_is_still_offered() {
+    let signed = long_ledger_commitment(1100);
+    assert!(fits(&signed).is_ok());
+    assert_eq!(verify(&signed), Vec::<String>::new());
+}
+
+#[test]
+fn a_commitment_larger_than_a_peer_reads_is_not_offered() {
+    let mut signed = built(&defaults());
+    assert!(fits(&signed).is_ok());
+    signed.policy = vec![b' '; crate::mesh_evidence_bridge::MAX_COMMITMENT_BYTES as usize];
+    let err = fits(&signed).unwrap_err();
+    assert!(err.contains("larger than a peer reads"), "{err}");
+}
+
+/// The staple is filed as loop's and capsule-cli's `evidence-commitment/1`
+/// reads it: one card under the stream the card itself names, in the
+/// `mesh-llm` community, with the key that signed the checkpoint, so a third
+/// party can verify the staple offline (Mesh-LLM/capsules-plugin#266).
+#[test]
+fn the_staple_is_one_card_filed_under_its_own_stream_with_the_checkpoint_key() {
+    let signed = built(&defaults());
+    let doc = &signed.commitment;
+    assert!(doc.get("history_card").is_none());
+    let cards = doc["history_cards"].as_array().unwrap();
+    assert_eq!(cards.len(), 1);
+    let card = &cards[0];
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(card["bytes"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(card["stream"], staple_stream(&raw).unwrap());
+    assert_eq!(card["community"], "mesh-llm");
+    assert_eq!(card["derivation"], "history_card/2");
+    assert_eq!(card["sha256"], hex::encode(Sha256::digest(&raw)));
+    let spki = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(card["checkpoint_key"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(spki, super::spki(&key().verifying_key()));
+}
+
+#[test]
+fn a_card_that_is_not_filed_as_loop_files_it_is_refused() {
+    for (edit, says) in [
+        (
+            (|c: &mut Value| c["stream"] = json!("other/stream")) as fn(&mut Value),
+            "stream is not the card's own evidence_stream",
+        ),
+        (
+            |c| c["stream"] = json!("../x"),
+            "stream must be a plain log id",
+        ),
+        (
+            |c| c["stream"] = json!(null),
+            "stream must be a plain log id",
+        ),
+        (|c| c["community"] = json!("nowhere"), "community"),
+        (|c| c["checkpoint_key"] = json!("AAAA"), "checkpoint_key"),
+        (
+            |c| c["extra"] = json!("x"),
+            "unknown field history_cards[0].extra",
+        ),
+        (
+            |c| {
+                c.as_object_mut().unwrap().remove("community");
+            },
+            "missing history_cards[0].community",
+        ),
+    ] {
+        let bad = resigned(&built(&defaults()), |d| edit(&mut d["history_cards"][0]));
+        let problems = verify(&bad);
+        assert!(
+            problems.iter().any(|p| p.contains(says)),
+            "{says}: {problems:?}"
+        );
+    }
+    let empty = resigned(&built(&defaults()), |d| d["history_cards"] = json!([]));
+    assert!(verify(&empty)
+        .iter()
+        .any(|p| p.contains("at least one card")));
+}
+
+/// A node's own `history_card/1` answer to a stranger at its latest
+/// checkpoint, as a peer that still staples `/1` carries it.
+fn real_history_card_1(dir: &std::path::Path) -> Vec<u8> {
+    let key = key();
+    let policy = defaults();
+    let digest = policy.digest(&key);
+    let announced = BTreeMap::new();
+    let replay = ReplayCache::default();
+    let responder = Responder {
+        ledger_dir: dir,
+        signing_key: &key,
+        now: NOW,
+        history_segments: policy.history_segments,
+        share_standard_history: policy.share_standard_history,
+        share_exchange_corroboration: policy.share_exchange_corroboration,
+        keys: Keys {
+            announced: &announced,
+            configured: None,
+            own_key: None,
+        },
+        replay: &replay,
+        node_id: Some(NODE),
+        policy_digest: Some(&digest),
+    };
+    let (_, anchor) = latest_checkpoint(&responder).unwrap();
+    let request = json!({
+        "subject": {"full_history": null},
+        "coverage": {"expected_pin": anchor},
+        "derivation": "history_card/1",
+    });
+    match evidence_answer::answer(&serde_json::to_vec(&request).unwrap(), &responder) {
+        Outcome::Answered { wire, .. } => serde_json::to_vec(&wire).unwrap(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A peer that still signs `/0` is read as before: one `history_card`, a
+/// genuine `history_card/1` answer; a `/2` answer under the `/0` label is
+/// refused.
+#[test]
+fn a_legacy_zero_commitment_still_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    corpus_ledger_dir(dir.path(), &key());
+    let one = real_history_card_1(dir.path());
+    let legacy = |staple: &[u8]| {
+        resigned(&built_over(dir.path(), &defaults()), |d| {
+            d.as_object_mut().unwrap().remove("history_cards");
+            d["profile"] = json!("evidence-commitment/0");
+            d["history_card"] = json!({
+                "derivation": "history_card/1",
+                "sha256": hex::encode(Sha256::digest(staple)),
+                "bytes": base64::engine::general_purpose::STANDARD.encode(staple),
+            });
+        })
+    };
+    assert_eq!(verify(&legacy(&one)), Vec::<String>::new());
+    let two = base64::engine::general_purpose::STANDARD
+        .decode(
+            built_over(dir.path(), &defaults()).commitment["history_cards"][0]["bytes"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(verify(&legacy(&two)).iter().any(|p| p.contains("declares")));
+}
+
+/// The derivation a card entry declares is the one its answer names.
+#[test]
+fn a_staple_declaring_one_card_and_carrying_the_other_is_refused() {
+    let signed = resigned(&built(&defaults()), |d| {
+        d["history_cards"][0]["derivation"] = json!("history_card/1")
+    });
+    assert!(verify(&signed).iter().any(|p| p.contains("declares")));
+}
+
+/// A staple whose result names no `evidence_stream` cannot be filed under
+/// any stream: `null` for both sides is not a match.
+#[test]
+fn a_staple_that_names_no_stream_is_refused_even_under_a_null_stream() {
+    let signed = restapled(&built(&defaults()), |card| {
+        card["artifact"] = json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}"));
+        card["artifact_digest"] = json!(hex::encode(Sha256::digest(b"{}")));
+    });
+    // As filed under a stream, the staple is refused for naming none.
+    let named = resigned(&signed, |d| d["history_cards"][0]["stream"] = json!("a"));
+    assert!(verify(&named)
+        .iter()
+        .any(|p| p.contains("stream is not the card's own evidence_stream")));
+    // Filed under `null`, it is refused for the shape.
+    let null = resigned(&signed, |d| d["history_cards"][0]["stream"] = json!(null));
+    assert!(verify(&null)
+        .iter()
+        .any(|p| p.contains("stream must be a plain log id")));
+}
+
+fn route() -> crate::nostr_announce::Route {
+    crate::nostr_announce::Route {
+        mailbox_key: hex::encode(
+            k256::schnorr::SigningKey::from_bytes(&[9; 32])
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        ),
+        relays: vec!["wss://relay.damus.io".into(), "wss://nos.lol".into()],
+    }
+}
+
+/// `ask.nostr` is signed into the commitment when a route is given
+/// (carriers spec section 3), and a commitment without one is as before.
+#[test]
+fn the_nostr_route_is_signed_into_ask_and_checked() {
+    let plain = built(&defaults());
+    assert!(plain.commitment["ask"].get("nostr").is_none());
+    let with = resigned(&plain, |d| d["ask"]["nostr"] = route().to_json());
+    assert_eq!(verify(&with), Vec::<String>::new());
+    assert_eq!(
+        with.commitment["ask"]["nostr"]["relays"][1],
+        "wss://nos.lol"
+    );
+    // A key that is not a point, a repeated relay and a stray member are refused.
+    let bad_key = resigned(&plain, |d| {
+        d["ask"]["nostr"] = route().to_json();
+        d["ask"]["nostr"]["mailbox_key"] = json!("ff".repeat(32));
+    });
+    assert!(verify(&bad_key).iter().any(|p| p.contains("mailbox_key")));
+    let twice = resigned(&plain, |d| {
+        d["ask"]["nostr"] = route().to_json();
+        d["ask"]["nostr"]["relays"] = json!(["wss://nos.lol", "wss://nos.lol"]);
+    });
+    assert!(verify(&twice).iter().any(|p| p.contains("repeats")));
+    let stray = resigned(&plain, |d| d["ask"]["extra"] = json!(1));
+    assert!(verify(&stray)
+        .iter()
+        .any(|p| p.contains("unknown field ask.extra")));
+}
+
+/// A `/0` commitment has no Nostr route: the member is `/1`'s.
+#[test]
+fn a_legacy_zero_commitment_with_a_route_is_refused() {
+    let signed = resigned(&built(&defaults()), |d| {
+        let card = d["history_cards"][0].clone();
+        d.as_object_mut().unwrap().remove("history_cards");
+        d["profile"] = json!("evidence-commitment/0");
+        d["history_card"] = json!({"derivation": card["derivation"], "sha256": card["sha256"], "bytes": card["bytes"]});
+        d["ask"]["nostr"] = route().to_json();
+    });
+    assert!(verify(&signed).iter().any(|p| p.contains("ask.nostr")));
+}
